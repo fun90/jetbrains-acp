@@ -105,6 +105,7 @@ for (const option of ['allow-once', 'reject-once', 'cancel']) {
   test(`工具授权：${option}`, async t => {
     const c = await client(t);
     const sid = await session(c);
+    await c.request('session/set_mode', { sessionId: sid, modeId: 'standard' });
     const prompt = c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'permission' }] });
     const permission = await c.wait(r => r.method === 'session/request_permission');
     assert.equal(permission.params.toolCall.locations[0].path, root + 'a.txt');
@@ -115,6 +116,38 @@ for (const option of ['allow-once', 'reject-once', 'cancel']) {
     assert.equal(tool.params.update.status, option === 'allow-once' ? 'completed' : 'failed');
   });
 }
+
+test('默认完全访问自动放行，标准访问允许本会话全部工具且不影响其他会话', async t => {
+  const c = await client(t);
+  const sid = await session(c);
+  const created = c.records.find(r => r.result?.sessionId === sid).result;
+  assert.equal(created.modes.currentModeId, 'full');
+  assert.equal(created.configOptions.find(option => option.id === 'mode').currentValue, 'full');
+  const toolPrompt = sessionId => c.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'permission' }] });
+  assert.equal((await toolPrompt(sid)).result.stopReason, 'end_turn');
+  assert.equal(c.records.filter(r => r.method === 'session/request_permission').length, 0);
+  const standard = await c.request('session/set_config_option', { sessionId: sid, configId: 'mode', value: 'standard' });
+  assert.equal(standard.result.configOptions.find(option => option.id === 'mode').currentValue, 'standard');
+  const first = toolPrompt(sid);
+  const permission = await c.wait(r => r.method === 'session/request_permission');
+  c.send({ jsonrpc: '2.0', id: permission.id, result: { outcome: { outcome: 'selected', optionId: 'allow-session' } } });
+  assert.equal((await first).result.stopReason, 'end_turn');
+  await toolPrompt(sid);
+  assert.equal(c.records.filter(r => r.method === 'session/request_permission').length, 1);
+  const other = await session(c);
+  await c.request('session/set_mode', { sessionId: other, modeId: 'standard' });
+  const second = toolPrompt(other);
+  const otherPermission = await c.wait(r => r.method === 'session/request_permission' && r.params.sessionId === other);
+  c.send({ jsonrpc: '2.0', id: otherPermission.id, result: { outcome: { outcome: 'selected', optionId: 'reject-once' } } });
+  await second;
+  assert.equal((await c.request('session/set_mode', { sessionId: sid, modeId: 'missing' })).error.code, -32602);
+  await c.request('session/set_mode', { sessionId: sid, modeId: 'standard' });
+  const third = toolPrompt(sid);
+  await c.wait(r => r.method === 'session/request_permission' && r.params.sessionId === sid && r.id !== permission.id);
+  // 切回完全访问应解除当前等待中的授权，而不是留下工具挂起。
+  await c.request('session/set_mode', { sessionId: sid, modeId: 'full' });
+  assert.equal((await third).result.stopReason, 'end_turn');
+});
 
 test('并发提示拒绝、取消和进程异常退出', async t => {
   const c = await client(t);

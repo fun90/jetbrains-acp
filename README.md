@@ -20,7 +20,7 @@ IDEA / AI Assistant ← ACP JSON-RPC / stdio → pi-acp ← RPC JSONL → pi
    ```
 
 3. 在 IDEA 的 AI Chat 中选择 **Add Custom Agent**，将生成的 `agent_servers.pi` 条目合并到 `~/.jetbrains/acp.json`，保留已有条目。也可参考 [examples/acp.json](examples/acp.json)。
-4. 在聊天界面选择 `pi`，发送消息。写文件、执行命令及其他非内置只读工具会请求 IDEA 授权；支持“允许本次”和“拒绝本次”。
+4. 在聊天界面选择 `pi`，发送消息。默认使用“完全访问”，自动允许工具调用。需要逐次授权时，将权限模式切换为“标准访问”；弹窗支持“允许本次”“本会话允许全部工具”和“拒绝本次”。
 
 需要支持 ACP 的 JetBrains IDE 与 AI Assistant 插件；菜单位置随版本变化，见 [JetBrains 官方配置说明](https://www.jetbrains.com/help/ai-assistant/acp.html)。配置生成命令只打印 JSON，不修改 IDE 配置。
 
@@ -43,6 +43,7 @@ IDEA / AI Assistant ← ACP JSON-RPC / stdio → pi-acp ← RPC JSONL → pi
 | `session/new` | 每个会话启动独立 pi 进程，使用 IDEA 传入的绝对 `cwd` |
 | 模型列表与切换 | 返回 `configOptions` 与兼容旧版的 `models`；支持 `session/set_config_option` 和 `session/set_model` |
 | 推理级别 | 通过 `thought_level` 配置选项连接 pi 的推理设置；模型切换后刷新可用级别与实际值 |
+| 权限模式 | 默认完全访问，支持标准访问；同时兼容 `session/set_mode` 与 `session/set_config_option` |
 | `session/prompt` | 转发文本、内嵌图片、文本资源和资源引用 |
 | `session/update` | 转发回答、思考内容、工具状态与工具输出 |
 | `session/cancel` | 解除待授权请求、清空 pi 队列并中止执行 |
@@ -65,9 +66,9 @@ PI_ACP_SMOKE=1 npm test
 
 ## 当前边界
 
-- 会话只在适配器运行期间保留；未实现 `session/load`、历史恢复及模式切换。IDEA 的模型菜单显示 pi 的可用模型，初始模型通过启动参数或 pi 设置选择。
+- 会话只在适配器运行期间保留；未实现 `session/load` 和历史恢复。IDEA 的模型菜单显示 pi 的可用模型，初始模型通过启动参数或 pi 设置选择。
 - 文件操作和命令由本机 pi 执行；未接入 ACP `fs/*` 或 `terminal/*`。使用前保存 IDEA 编辑器内容，工具状态中会提供文件位置，但尚未生成 ACP 文件 diff。
-- 工具授权不是操作系统沙箱。内置 `read`、`grep`、`find`、`ls` 自动执行；其他工具每次请求授权。用户安装的 pi 扩展自身仍属于受信任代码，扩展直接执行的副作用不属于此工具授权边界。
+- 工具授权不是操作系统沙箱。完全访问自动允许全部工具，包括写文件、执行命令和 MCP 调用；标准访问自动允许内置 `read`、`grep`、`find`、`ls`，其他工具每次请求授权。选择“本会话允许全部工具”等同于切换完全访问；模式只影响当前会话，新会话默认完全访问。用户安装的 pi 扩展自身仍属于受信任代码，扩展直接执行的副作用不属于此工具授权边界。
 - 一般 pi 扩展的 `select`、`input`、`editor`、自定义 `confirm` 交互会返回取消，并在当前回合提示不支持；只桥接本适配器的工具授权对话框。
 - 图片支持最终取决于所选模型；不支持音频和二进制内嵌资源。资源引用只转发 URI，由 pi 根据可用工具读取。
 - 已验证协议流程及本机 pi 启动；IDEA 界面联调、真实模型执行和真实 MCP 服务器调用需要在目标环境验证。

@@ -7,6 +7,10 @@ import { PiProcess } from './pi.js';
 
 const extensionPath = fileURLToPath(new URL('../extensions/acp.ts', import.meta.url));
 const invalid = message => Object.assign(new Error(message), { code: -32602 });
+const modes = [
+  { id: 'standard', name: '标准访问', description: '写文件、执行命令及其他非内置只读工具逐次请求授权' },
+  { id: 'full', name: '完全访问', description: '本会话自动允许全部工具调用，包括写文件和执行命令' },
+];
 const toolKind = name => ({ read: 'read', grep: 'search', find: 'search', ls: 'read',
   write: 'edit', edit: 'edit', bash: 'execute', powershell: 'execute' })[name] || 'other';
 
@@ -123,12 +127,18 @@ export class Agent {
     if (!this.initialized) throw invalid('请先 initialize');
     if (this.closing) throw new Error('适配器正在关闭');
     if (method === 'session/new') return this.newSession(params);
-    if (!['session/prompt', 'session/cancel', 'session/set_model', 'session/set_config_option'].includes(method)) {
+    if (!['session/prompt', 'session/cancel', 'session/set_model', 'session/set_config_option', 'session/set_mode'].includes(method)) {
       throw Object.assign(new Error(`不支持的方法：${method}`), { code: -32601 });
     }
     const session = this.sessions.get(params.sessionId);
     if (!session) throw invalid('会话不存在');
     if (session.failure) throw session.failure;
+    if (method === 'session/set_mode' || (method === 'session/set_config_option' && params.configId === 'mode')) {
+      const modeId = method === 'session/set_mode' ? params.modeId : params.value;
+      if (!modes.some(mode => mode.id === modeId)) throw invalid('未知权限模式');
+      this.setMode(session, modeId);
+      return method === 'session/set_mode' ? {} : { configOptions: this.modelConfig(session) };
+    }
     if (method === 'session/set_model' || method === 'session/set_config_option') {
       const configId = method === 'session/set_model' ? 'model' : params.configId;
       const value = method === 'session/set_model' ? params.modelId : params.value;
@@ -187,7 +197,7 @@ export class Agent {
     const mcpServers = convertMcp(params.mcpServers);
     const directory = await mkdtemp(join(tmpdir(), 'pi-acp-'));
     const configPath = join(directory, 'config.json');
-    const session = { id: randomUUID(), cwd: params.cwd, directory, turn: null, tools: new Map(), blocks: new Map() };
+    const session = { id: randomUUID(), cwd: params.cwd, directory, mode: 'full', turn: null, tools: new Map(), blocks: new Map() };
     this.sessions.set(session.id, session);
     try {
       await writeFile(configPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
@@ -216,7 +226,8 @@ export class Agent {
       if (!state?.model) await session.pi.request('set_model', { provider: current.provider, modelId: current.id });
       session.currentModelId = `${current.provider}/${current.id}`;
       await this.refreshThinking(session);
-      return { sessionId: session.id, configOptions: this.modelConfig(session), models: {
+      return { sessionId: session.id, configOptions: this.modelConfig(session),
+        modes: { currentModeId: session.mode, availableModes: modes }, models: {
         currentModelId: session.currentModelId,
         availableModels: session.availableModels.map(model => ({
           modelId: `${model.provider}/${model.id}`, name: `${model.name || model.id} (${model.provider})`,
@@ -227,6 +238,20 @@ export class Agent {
       await session.pi?.close();
       await rm(directory, { recursive: true, force: true });
       throw error;
+    }
+  }
+
+  setMode(session, modeId) {
+    session.mode = modeId;
+    this.update(session, { sessionUpdate: 'current_mode_update', currentModeId: modeId });
+    this.update(session, { sessionUpdate: 'config_option_update', configOptions: this.modelConfig(session) });
+    if (modeId === 'full') {
+      for (const [id, permission] of this.permissions) {
+        if (permission.session === session) {
+          this.permissions.delete(id);
+          permission.resolve({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
+        }
+      }
     }
   }
 
@@ -249,6 +274,9 @@ export class Agent {
       options: session.thinkingLevels.map(level => ({ value: level,
         name: ({ off: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高' })[level] || level,
       })),
+    }, { id: 'mode', name: '权限模式', category: 'mode', type: 'select',
+      currentValue: session.mode,
+      options: modes.map(mode => ({ value: mode.id, name: mode.name, description: mode.description })),
     }];
   }
 
@@ -362,17 +390,24 @@ export class Agent {
       session.pi.send({ type: 'extension_ui_response', id: event.id, cancelled: true });
       return;
     }
+    if (session.mode === 'full') {
+      session.pi.send({ type: 'extension_ui_response', id: event.id, confirmed: true });
+      this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: call.toolCallId, status: 'in_progress' });
+      return;
+    }
     const tool = session.tools.get(call.toolCallId) ?? this.tool(session, call);
     const id = `acp-permission-${++this.sequence}`;
     const decision = new Promise(resolve => this.permissions.set(id, { session, resolve }));
     this.send({ jsonrpc: '2.0', id, method: 'session/request_permission',
       params: { sessionId: session.id, toolCall: { ...tool, status: 'pending' }, options: [
         { optionId: 'allow-once', name: '允许本次', kind: 'allow_once' },
+        { optionId: 'allow-session', name: '本会话允许全部工具', kind: 'allow_always' },
         { optionId: 'reject-once', name: '拒绝本次', kind: 'reject_once' },
       ] } });
     const result = await decision;
     const approved = !session.turn?.cancelled && result?.outcome?.outcome === 'selected' &&
-      result.outcome.optionId === 'allow-once';
+      ['allow-once', 'allow-session'].includes(result.outcome.optionId);
+    if (approved && result.outcome.optionId === 'allow-session') this.setMode(session, 'full');
     if (!session.pi.closed) session.pi.send({ type: 'extension_ui_response', id: event.id, confirmed: approved });
     if (approved) this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: call.toolCallId, status: 'in_progress' });
   }
