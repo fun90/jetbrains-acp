@@ -1,0 +1,14 @@
+{
+  "agent_servers": {
+    "pi": {
+      "command": "/绝对路径/node",
+      "args": [
+        "/绝对路径/jetbrains-acp/src/index.js",
+        "--pi-command",
+        "/绝对路径/pi"
+      ],
+      "use_idea_mcp": true,
+      "use_custom_mcp": true
+    }
+  }
+}
