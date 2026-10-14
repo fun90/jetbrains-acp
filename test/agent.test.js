@@ -4,10 +4,10 @@ import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readJsonl, writeJsonl } from '../src/jsonl.js';
 import { Agent, convertMcp, convertPrompt } from '../src/agent.js';
 
@@ -46,24 +46,39 @@ async function client(t, real = false, savedDirectory, extraArgs = []) {
     send({ jsonrpc: '2.0', id: requestId, method, params });
     return wait(record => record.id === requestId && !record.method);
   };
+  let crashed = false;
   t.after(async () => {
     for (const waiter of waiters) clearTimeout(waiter.timer);
-    const exit = once(child, 'exit');
-    child.stdin.end();
-    await exit;
-    assert.equal(child.exitCode, 0, stderr);
+    if (child.exitCode === null && child.signalCode === null) {
+      const exit = once(child, 'exit');
+      child.stdin.end();
+      await exit;
+    }
+    if (crashed) assert.equal(child.signalCode, 'SIGKILL');
+    else assert.equal(child.exitCode, 0, stderr);
     if (!savedDirectory) await rm(directory, { recursive: true, force: true });
   });
-  return { child, records, request, send, wait, directory };
+  const crash = async () => {
+    crashed = true;
+    const exited = once(child, 'exit');
+    child.kill('SIGKILL');
+    await exited;
+  };
+  return { child, records, request, send, wait, directory, crash };
 }
 
-async function session(c, mcpServers = []) {
-  const initialized = await c.request('initialize', { protocolVersion: 1 });
+async function session(c, mcpServers = [], clientCapabilities, cwd = root) {
+  const initialized = await c.request('initialize', { protocolVersion: 1, ...(clientCapabilities ? { clientCapabilities } : {}) });
   assert.equal(initialized.result.protocolVersion, 1);
   assert.deepEqual(initialized.result._meta.steering, { supported: true });
   assert.equal(initialized.result.agentCapabilities.loadSession, true);
+  if (!clientCapabilities?._meta?.jetbrains?.air) assert.equal(initialized.result._meta.jetbrains, undefined);
   assert.deepEqual(initialized.result.agentCapabilities.sessionCapabilities.list, {});
-  const created = await c.request('session/new', { cwd: root, mcpServers });
+  assert.deepEqual(initialized.result.agentCapabilities.sessionCapabilities.resume, {});
+  assert.deepEqual(initialized.result.agentCapabilities.sessionCapabilities.close, {});
+  assert.deepEqual(initialized.result.agentCapabilities.sessionCapabilities.delete, {});
+  assert.deepEqual(initialized.result.agentCapabilities.sessionCapabilities.fork, {});
+  const created = await c.request('session/new', { cwd, mcpServers });
   assert.ok(created.result?.sessionId, JSON.stringify(created));
   assert.ok(created.result.models.availableModels.length > 0);
   assert.equal(created.result.configOptions[0].currentValue, created.result.models.currentModelId);
@@ -71,6 +86,159 @@ async function session(c, mcpServers = []) {
   assert.equal(thinking.category, 'thought_level');
   assert.ok(thinking.options.some(option => option.value === thinking.currentValue));
   return created.result.sessionId;
+}
+
+test('终端输入校验会话、权限、取消状态及能力协商', async () => {
+  const records = [];
+  const requests = [];
+  const agent = new Agent({ send: record => records.push(record) });
+  await agent.dispatch('initialize', { protocolVersion: 1 });
+  const params = { sessionId: 'a', terminalId: 'cmd', data: '你好\n' };
+  await assert.rejects(agent.dispatch('_terminal/input', params), /未启用/);
+  await agent.dispatch('initialize', { protocolVersion: 1, clientCapabilities: { _meta: { terminal_input: true } } });
+  const session = { id: 'a', mode: 'full', turn: {}, inputTerminals: new Set(['cmd']),
+    pi: { request: async (...args) => requests.push(args) } };
+  agent.sessions.set('a', session);
+  await assert.rejects(agent.dispatch('_terminal/input', { ...params, sessionId: 'b' }), /不存在/);
+  await assert.rejects(agent.dispatch('_terminal/input', { ...params, terminalId: 'other' }), /不可输入/);
+  await assert.rejects(agent.dispatch('_terminal/input', { ...params, data: '你'.repeat(22000) }), /参数无效/);
+  for (const mode of ['plan', 'read-only']) {
+    session.mode = mode;
+    await assert.rejects(agent.dispatch('_terminal/input', params), /不可输入/);
+  }
+  session.mode = 'full';
+  session.turn.cancelled = true;
+  await assert.rejects(agent.dispatch('_terminal/input', params), /不可输入/);
+  session.turn.cancelled = false;
+  assert.deepEqual(await agent.dispatch('_terminal/input', { ...params, eof: true }), {});
+  assert.deepEqual(requests, [['terminal_input', { terminalId: 'cmd', data: '你好\n', eof: true }]]);
+  assert.deepEqual(records.at(-1).params.update._meta.terminal_input, { terminal_id: 'cmd', data: '你好\n' });
+  await assert.rejects(agent.dispatch('_terminal/input', params), /不可输入/);
+});
+
+test('Air v1 聊天命令直接写入 stdin，保留空白并拒绝歧义与无权限输入', async () => {
+  const requests = [];
+  const agent = new Agent({ send() {} });
+  await agent.dispatch('initialize', { protocolVersion: 1,
+    clientCapabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } } });
+  assert.equal(agent.terminalInputEnabled, true);
+  const session = { id: 'a', mode: 'full', turn: {}, inputTerminals: new Set(['cmd']),
+    pi: { request: async (...args) => requests.push(args) } };
+  agent.sessions.set('a', session);
+  const send = (text, method = '_session/steering') => agent.dispatch(method,
+    { sessionId: 'a', prompt: [{ type: 'text', text }] });
+  assert.deepEqual(await send('/stdin  你好  '), { outcome: 'injected' });
+  assert.deepEqual(requests[0], ['terminal_input', { terminalId: 'cmd', data: ' 你好  \n', eof: false }]);
+  assert.deepEqual(await send('/stdin', 'session/prompt'), { stopReason: 'end_turn' });
+  assert.equal(requests[1][1].data, '\n');
+  session.inputTerminals.add('other');
+  await assert.rejects(send('/stdin 不能串进程'), /恰好一个/);
+  session.inputTerminals.delete('other');
+  session.mode = 'read-only';
+  await assert.rejects(send('/stdin 拒绝'), /不可输入/);
+  session.mode = 'full';
+  session.turn.cancelled = true;
+  await assert.rejects(send('/stdin 拒绝'), /不可输入/);
+  session.turn.cancelled = false;
+  await assert.rejects(send('/stdin ' + '你'.repeat(22000)), /参数无效/);
+  await send('/eof');
+  assert.deepEqual(requests.at(-1), ['terminal_input', { terminalId: 'cmd', data: '', eof: true }]);
+  await assert.rejects(send('/stdin 已关闭'), /恰好一个/);
+  assert.equal(requests.length, 3);
+  const v2 = new Agent({ send() {} });
+  v2.protocolVersion = 2;
+  await v2.dispatch('initialize', { protocolVersion: 1,
+    clientCapabilities: { _meta: { jetbrains: { air: {} } } } });
+  assert.equal(v2.terminalInputEnabled, false);
+});
+
+for (const version of [1, 2]) {
+  test(`本机 pi ACP v${version} 交互 stdin、EOF 和取消（本地模型替身）`, { skip: !process.env.PI_ACP_SMOKE }, async t => {
+    const directory = await mkdtemp(join(tmpdir(), 'pi-acp-stdin-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const extension = join(directory, 'stdin-model.ts');
+    await writeFile(extension, `import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+    export default function (pi: any) {
+      let step = 0;
+      pi.registerProvider('stdin-test', {
+        api: 'stdin-test-api', apiKey: 'test', baseUrl: 'http://localhost',
+        models: [{ id: 'mock', name: 'stdin 测试模型', reasoning: false, input: ['text'],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+        streamSimple: (model: any, context: any) => {
+          const stream = createAssistantMessageEventStream();
+          const call = step++ % 2 === 0;
+          const reason = call ? 'toolUse' : 'stop';
+          const message = { role: 'assistant',
+            content: call ? [{ type: 'toolCall', id: 'stdin-' + step, name: 'bash',
+              arguments: { command: 'printf ready; cat', timeout: 10 } }] : [{ type: 'text', text: '完成' }],
+            api: model.api, provider: model.provider, model: model.id, stopReason: reason, timestamp: Date.now(),
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+          stream.push({ type: 'done', reason, message }); stream.end(); return stream;
+        },
+      });
+    }`);
+    const c = await client(t, true, undefined, ['--extension', extension, '--model', 'stdin-test/mock']);
+    const initialized = await c.request('initialize', { protocolVersion: version,
+      ...(version === 1 ? { clientCapabilities: { _meta: { terminal_output_delta: true,
+        jetbrains: { air: { version: 1, capabilities: [] } } } } }
+        : { info: { name: 'stdin-test', version: '1' }, capabilities: { _meta: { terminal_input: true } } }) });
+    assert.equal(initialized.result._meta.terminal_input.controlMethod, '_terminal/input');
+    const sid = (await c.request('session/new', { cwd: directory, mcpServers: [] })).result.sessionId;
+    assert.ok(sid);
+    if (version === 1) await c.request('session/set_mode', { sessionId: sid, modeId: 'standard' });
+    const prompt = c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '等待输入' }] });
+    if (version === 1) {
+      const permission = await c.wait(record => record.method === 'session/request_permission');
+      assert.equal((await c.request('_terminal/input', { sessionId: sid, terminalId: 'stdin-1', data: '未授权' })).error.code, -32602);
+      assert.ok(!c.records.some(record => record.params?.update?._meta?.terminal_info?.input_enabled));
+      c.send({ jsonrpc: '2.0', id: permission.id, result: { outcome: { outcome: 'selected', optionId: 'allow-once' } } });
+    }
+    const ready = await c.wait(record => record.params?.sessionId === sid &&
+      (version === 1 ? record.params.update?._meta?.terminal_info?.input_enabled === true
+        : record.params.update?.sessionUpdate === 'terminal_update' && record.params.update?.inputEnabled === true));
+    const terminalId = version === 1 ? ready.params.update.toolCallId : ready.params.update.terminalId;
+    if (version === 1) {
+      assert.deepEqual((await c.request('_session/steering', { sessionId: sid,
+        prompt: [{ type: 'text', text: '/stdin 你好' }] })).result, { outcome: 'injected' });
+    } else assert.deepEqual((await c.request('_terminal/input', { sessionId: sid, terminalId, data: '你好\n' })).result, {});
+    if (version === 1) {
+      await c.request('_terminal/input', { sessionId: sid, terminalId, data: '尾部' });
+      assert.deepEqual((await c.request('_session/steering', { sessionId: sid,
+        prompt: [{ type: 'text', text: '/eof' }] })).result, { outcome: 'injected' });
+    } else assert.deepEqual((await c.request('_terminal/input', { sessionId: sid, terminalId, data: '尾部', eof: true })).result, {});
+    await prompt;
+    if (version === 2) await c.wait(record => record.params?.sessionId === sid &&
+      record.params.update?.state === 'idle' && record.params.update?.stopReason === 'end_turn');
+    const outputs = c.records.filter(record => record.method === 'session/update' && record.params?.sessionId === sid)
+      .map(record => record.params.update);
+    const text = outputs.map(update => version === 1 ? update._meta?.terminal_output_delta?.data ?? ''
+      : update.sessionUpdate === 'terminal_output_chunk' ? Buffer.from(update.data, 'base64').toString() : '').join('');
+    assert.equal(text, 'ready你好\n尾部');
+    assert.ok(outputs.some(update => update._meta?.terminal_input?.data === '你好\n'));
+    assert.equal((await c.request('_terminal/input', { sessionId: sid, terminalId, data: '迟到' })).error.code, -32602);
+    if (version === 1) await c.request('session/set_mode', { sessionId: sid, modeId: 'full' });
+    const cancelled = c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '取消等待' }] });
+    await c.wait(record => record.params?.sessionId === sid && (version === 1
+      ? record.params.update?.toolCallId === 'stdin-3' && record.params.update?._meta?.terminal_info?.input_enabled === true
+      : record.params.update?.terminalId === 'stdin-3' && record.params.update?.inputEnabled === true));
+    assert.deepEqual((await c.request('session/cancel', { sessionId: sid })).result, {});
+    const response = await cancelled;
+    if (version === 1) assert.equal(response.result.stopReason, 'cancelled');
+    else await c.wait(record => record.params?.sessionId === sid && record.params.update?.stopReason === 'cancelled');
+    const forked = await c.request('session/fork', { sessionId: sid, cwd: directory, mcpServers: [] });
+    assert.ok(forked.result?.sessionId, JSON.stringify(forked));
+    const forkId = forked.result.sessionId;
+    const afterFork = c.request('session/prompt', { sessionId: forkId, prompt: [{ type: 'text', text: '分叉后输入' }] });
+    const forkReady = await c.wait(record => record.params?.sessionId === forkId && (version === 1
+      ? record.params.update?._meta?.terminal_info?.input_enabled === true : record.params.update?.inputEnabled === true));
+    const forkTerminal = version === 1 ? forkReady.params.update.toolCallId : forkReady.params.update.terminalId;
+    assert.deepEqual((await c.request('_terminal/input', { sessionId: forkId, terminalId: forkTerminal,
+      data: '分叉后通道正常', eof: true })).result, {});
+    assert.ok((await afterFork).result);
+    if (version === 2) await c.wait(record => record.params?.sessionId === forkId &&
+      record.params.update?.state === 'idle' && record.params.update?.stopReason === 'end_turn');
+  });
 }
 
 test('JSONL 保留 Unicode 分隔符并处理分段 UTF-8 与 CRLF', () => {
@@ -143,8 +311,13 @@ test('本机 pi 自动命名、扩展改名及 steering（显式启用，使用�
       streamSimple: (model: any, context: any) => {
         const stream = createAssistantMessageEventStream();
         const input = context.messages.filter((message: any) => message.role === 'user').at(-1);
+        const goalSection = context.messages.filter((message: any) => message.role === 'system')
+          .reduce((value: any, message: any) => 'acp_goal' in (message.sections ?? {})
+            ? message.sections.acp_goal : value, null);
         const text = input?.content?.some((block: any) => block.text === '等待引导') ? '等待引导已开始'
-          : input?.content?.some((block: any) => block.text === '补充约束') ? '已采纳补充约束' : '测试回答';
+          : input?.content?.some((block: any) => block.text === '补充约束') ? '已采纳补充约束'
+            : input?.content?.some((block: any) => block.text === '验证目标提示')
+              ? goalSection?.includes('真实目标') ? '已注入目标' : '目标未注入' : '测试回答';
         const message = { role: 'assistant', content: [{ type: 'text', text }],
           api: model.api, provider: model.provider, model: model.id, stopReason: 'stop', timestamp: Date.now(),
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -170,7 +343,7 @@ test('本机 pi 自动命名、扩展改名及 steering（显式启用，使用�
     });
   }`);
   const c = await client(t, true, undefined, ['--extension', extension, '--model', 'title-test/mock']);
-  const sid = await session(c);
+  const sid = await session(c, [], { _meta: { jetbrains: { air: { version: 1, capabilities: ['sessionIndex'] } } } });
   const first = await c.request('session/prompt', { sessionId: sid,
     prompt: [{ type: 'text', text: '验证首轮自动命名' }] });
   assert.equal(first.result.stopReason, 'end_turn');
@@ -182,6 +355,34 @@ test('本机 pi 自动命名、扩展改名及 steering（显式启用，使用�
   const response = await c.request('session/prompt', { sessionId: sid,
     prompt: [{ type: 'text', text: '/__test_title 本机扩展标题' }] });
   assert.equal(response.result.stopReason, 'end_turn');
+  const firstAnswerId = c.records.find(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'agent_message_chunk').params.update.messageId;
+  assert.deepEqual((await c.request('_session/goal', { sessionId: sid, action: 'set',
+    objective: '真实目标\n保留多行' })).result, {});
+  for (const [action, expected] of [[null, '已注入目标'], ['pause', '目标未注入'], ['resume', '已注入目标']]) {
+    if (action) assert.deepEqual((await c.request('_session/goal', { sessionId: sid, action })).result, {});
+    assert.equal((await c.request('session/prompt', { sessionId: sid,
+      prompt: [{ type: 'text', text: '验证目标提示' }] })).result.stopReason, 'end_turn');
+    assert.equal(c.records.findLast(record => record.params?.sessionId === sid &&
+      record.params.update.sessionUpdate === 'agent_message_chunk').params.update.content.text, expected);
+  }
+  const forked = await c.request('session/fork', { sessionId: sid, cwd: root, mcpServers: [] });
+  assert.ok(forked.result?.sessionId && forked.result.sessionId !== sid, JSON.stringify(forked));
+  const forkInfo = (await c.request('session/list', { cwd: root })).result.sessions
+    .find(info => info.sessionId === forked.result.sessionId);
+  assert.equal(forkInfo._meta.jetbrains.air.forkedFrom, sid);
+  const forkGoal = await c.wait(record => record.params?.sessionId === forked.result.sessionId &&
+    record.params.update._meta?.jetbrains?.air?.goal?.objective === '真实目标\n保留多行');
+  assert.equal(forkGoal.params.update._meta.jetbrains.air.goal.status, 'active');
+  assert.equal((await c.request('session/prompt', { sessionId: forked.result.sessionId,
+    prompt: [{ type: 'text', text: '验证分叉继续' }] })).result.stopReason, 'end_turn');
+  assert.equal((await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: '验证源会话继续' }] })).result.stopReason, 'end_turn');
+  const historicalFork = await c.request('session/fork', { sessionId: sid, cwd: root, mcpServers: [],
+    _meta: { jetbrains: { air: { fork: { version: 1, messageId: firstAnswerId } } } } });
+  assert.ok(historicalFork.result?.sessionId, JSON.stringify(historicalFork));
+  assert.equal((await c.request('session/prompt', { sessionId: historicalFork.result.sessionId,
+    prompt: [{ type: 'text', text: '验证历史分叉继续' }] })).result?.stopReason, 'end_turn');
   const update = await c.wait(record => record.params?.update?.title === '本机扩展标题');
   assert.equal(update.params.sessionId, sid);
   assert.equal(update.params.update.title, '本机扩展标题');
@@ -196,6 +397,15 @@ test('本机 pi 自动命名、扩展改名及 steering（显式启用，使用�
   const idle = await c.request('_session/steering', { sessionId: sid,
     prompt: [{ type: 'text', text: '补充约束' }] });
   assert.deepEqual(idle.result, { outcome: 'startedNewTurn' });
+  assert.deepEqual((await c.request('_session/archive', { sessionId: sid })).result, {});
+  const archived = await c.request('session/list', { cwd: root,
+    _meta: { jetbrains: { air: { list: { archived: 'archived' } } } } });
+  assert.equal(archived.result.sessions.find(info => info.sessionId === sid)._meta.jetbrains.air.archived, true);
+  assert.deepEqual((await c.request('_session/unarchive', { sessionId: sid })).result, {});
+  assert.ok((await c.request('session/resume', { sessionId: sid, cwd: root, mcpServers: [] })).result);
+  const restoredGoal = await c.wait(record => record.params?.sessionId === sid &&
+    record.params.update._meta?.jetbrains?.air?.goal?.objective === '真实目标\n保留多行');
+  assert.equal(restoredGoal.params.update._meta.jetbrains.air.goal.status, 'active');
 });
 
 for (const option of ['allow-once', 'reject-once', 'cancel']) {
@@ -238,6 +448,24 @@ test('默认完全访问自动放行，标准访问允许本会话全部工具�
   c.send({ jsonrpc: '2.0', id: otherPermission.id, result: { outcome: { outcome: 'selected', optionId: 'reject-once' } } });
   await second;
   assert.equal((await c.request('session/set_mode', { sessionId: sid, modeId: 'missing' })).error.code, -32602);
+  const pendingPermission = toolPrompt(other);
+  const strictPermission = await c.wait(r => r.method === 'session/request_permission' &&
+    r.params.sessionId === other && r.id !== otherPermission.id);
+  await c.request('session/set_mode', { sessionId: other, modeId: 'read-only' });
+  c.send({ jsonrpc: '2.0', id: strictPermission.id,
+    result: { outcome: { outcome: 'selected', optionId: 'allow-once' } } });
+  assert.equal((await pendingPermission).result.stopReason, 'end_turn');
+  assert.equal(c.records.findLast(r => r.params?.sessionId === other && r.params.update.rawOutput)
+    .params.update.status, 'failed');
+  const permissionsBeforeReadOnly = c.records.filter(r => r.method === 'session/request_permission').length;
+  await c.request('session/set_mode', { sessionId: sid, modeId: 'plan' });
+  assert.equal((await toolPrompt(sid)).result.stopReason, 'end_turn');
+  assert.equal(c.records.filter(r => r.method === 'session/request_permission').length, permissionsBeforeReadOnly);
+  assert.equal(c.records.findLast(r => r.params?.update?.rawOutput).params.update.status, 'failed');
+  await c.request('session/set_mode', { sessionId: sid, modeId: 'read-only' });
+  assert.equal((await toolPrompt(sid)).result.stopReason, 'end_turn');
+  assert.equal(c.records.filter(r => r.method === 'session/request_permission').length, permissionsBeforeReadOnly);
+  assert.equal(c.records.findLast(r => r.params?.update?.rawOutput).params.update.status, 'failed');
   await c.request('session/set_mode', { sessionId: sid, modeId: 'standard' });
   const third = toolPrompt(sid);
   await c.wait(r => r.method === 'session/request_permission' && r.params.sessionId === sid && r.id !== permission.id);
@@ -298,7 +526,8 @@ test('steering 参数校验、失败响应与回合结束竞态', async () => {
   agent.initialized = true;
   let release;
   let submissions = 0;
-  const session = { id: 'test', turn: null, pi: { request: async () => {
+  const session = { id: 'test', turn: null, pi: { request: async type => {
+    if (type === 'get_session_stats') return { tokens: {}, cost: 0 };
     if (++submissions === 1) {
       agent.event(session, { type: 'agent_start' });
       return { disposition: 'started' };
@@ -326,7 +555,8 @@ test('steering 参数校验、失败响应与回合结束竞态', async () => {
   assert.ok(session.turn);
   agent.event(session, { type: 'agent_start' });
   agent.event(session, { type: 'agent_settled' });
-  assert.equal((await first).stopReason, 'end_turn');
+  const finished = await first;
+  assert.equal(finished.stopReason, 'end_turn');
   assert.equal(session.turn, null);
   assert.deepEqual(await agent.dispatch('_session/steering', params), { outcome: 'failed' });
   assert.equal(session.turn, null);
@@ -342,6 +572,378 @@ test('并发提示拒绝、取消和进程异常退出', async t => {
   assert.equal((await first).result.stopReason, 'cancelled');
   assert.match((await c.request('session/prompt', { sessionId: sid,
     prompt: [{ type: 'text', text: 'crash' }] })).error.message, /退出/);
+});
+
+test('同一会话的生命周期操作串行，避免重复打开', async () => {
+  const agent = new Agent({ send: () => {} });
+  agent.initialized = true;
+  let running = 0;
+  let maximum = 0;
+  agent.resumeSession = async () => {
+    running++;
+    maximum = Math.max(maximum, running);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    running--;
+    return {};
+  };
+  await Promise.all([
+    agent.dispatch('session/resume', { sessionId: 'same' }),
+    agent.dispatch('session/resume', { sessionId: 'same' }),
+  ]);
+  assert.equal(maximum, 1);
+});
+
+test('Air 扩展只在客户端声明后协商 diff patch 与改名', async t => {
+  const c = await client(t);
+  const initialized = await c.request('initialize', { protocolVersion: 1,
+    clientCapabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: ['diffPatch'] } } } } });
+  assert.deepEqual(initialized.result._meta.jetbrains.air.capabilities,
+    ['diffPatch', 'agentFileChangeReport', 'customInstructions', 'recommendedValue', 'sessionFailure', 'asyncTasks', 'nativeSubagentSessions']);
+});
+
+test('归档状态持久保存，订阅检测改名并支持取消', async t => {
+  const c = await client(t);
+  const initialized = await c.request('initialize', { protocolVersion: 1,
+    clientCapabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: ['sessionIndex'] } } } } });
+  assert.ok(initialized.result._meta.jetbrains.air.capabilities.includes('sessionArchive'));
+  assert.ok(initialized.result._meta.jetbrains.air.capabilities.includes('sessionListSubscribe'));
+  const sid = (await c.request('session/new', { cwd: root, mcpServers: [] })).result.sessionId;
+  await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '索引测试' }] });
+  assert.deepEqual((await c.request('_session/archive', { sessionId: sid })).result, {});
+  assert.ok(!(await c.request('session/list', { cwd: root })).result.sessions.some(info => info.sessionId === sid));
+  const archived = (await c.request('session/list', { cwd: root,
+    _meta: { jetbrains: { air: { list: { archived: 'archived' } } } } })).result.sessions;
+  assert.equal(archived.find(info => info.sessionId === sid)._meta.jetbrains.air.archived, true);
+  assert.deepEqual((await c.request('_session/unarchive', { sessionId: sid })).result, {});
+  assert.ok((await c.request('session/list', { cwd: root })).result.sessions.some(info => info.sessionId === sid));
+  const subscribed = await c.request('_session/list/subscribe', { cwd: root });
+  const id = subscribed.result.subscriptionId;
+  const initial = await c.wait(record => record.method === '_session/list/changes' && record.params.subscriptionId === id);
+  assert.ok(initial.params.sessions.some(info => info.sessionId === sid));
+  await c.request('_session/rename', { sessionId: sid, title: '订阅后的新名称' });
+  const changed = await c.wait(record => record.method === '_session/list/changes' &&
+    record.params.subscriptionId === id && record.params.sessions.some(info => info.title === '订阅后的新名称'));
+  assert.ok(changed.params.sessions.every(info => !('path' in info)));
+  assert.deepEqual((await c.request('_session/list/unsubscribe', { subscriptionId: id })).result, {});
+  assert.deepEqual((await c.request('_session/list/unsubscribe', { subscriptionId: id })).result, {});
+});
+
+test('Air goal 支持设置、暂停、恢复和清除', async t => {
+  const c = await client(t);
+  const initialized = await c.request('initialize', { protocolVersion: 1,
+    clientCapabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } } });
+  assert.deepEqual(initialized.result._meta.jetbrains.air.goal,
+    { version: 1, controlMethod: '_session/goal', actions: ['set', 'pause', 'resume', 'clear'] });
+  const created = await c.request('session/new', { cwd: root, mcpServers: [] });
+  const sid = created.result.sessionId;
+  assert.deepEqual((await c.request('_session/goal', { sessionId: sid, action: 'set', objective: ' 完成发布 ' })).result, {});
+  let goal = c.records.findLast(record => record.params?.update?._meta?.jetbrains?.air?.goal)
+    .params.update._meta.jetbrains.air.goal;
+  assert.equal(goal.objective, '完成发布');
+  assert.equal(goal.status, 'active');
+  assert.deepEqual((await c.request('_session/goal', { sessionId: sid, action: 'pause' })).result, {});
+  goal = c.records.findLast(record => record.params?.update?._meta?.jetbrains?.air?.goal)
+    .params.update._meta.jetbrains.air.goal;
+  assert.equal(goal.status, 'paused');
+  await c.request('session/close', { sessionId: sid });
+  assert.ok((await c.request('session/resume', { sessionId: sid, cwd: root, mcpServers: [] })).result);
+  const restored = c.records.findLast(record => record.params?.update?._meta?.jetbrains?.air?.goal)
+    .params.update._meta.jetbrains.air.goal;
+  assert.equal(restored.objective, '完成发布');
+  assert.equal(restored.status, 'paused');
+  assert.deepEqual((await c.request('_session/goal', { sessionId: sid, action: 'resume' })).result, {});
+  assert.deepEqual((await c.request('_session/goal', { sessionId: sid, action: 'clear' })).result, {});
+  const cleared = c.records.findLast(record => record.params?.update?._meta?.jetbrains?.air &&
+    'goal' in record.params.update._meta.jetbrains.air);
+  assert.equal(cleared.params.update._meta.jetbrains.air.goal, null);
+  assert.equal((await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: '/goal 多行目标\n保留换行' }] })).result.stopReason, 'end_turn');
+  const multiline = c.records.findLast(record => record.params?.update?._meta?.jetbrains?.air?.goal)
+    .params.update._meta.jetbrains.air.goal;
+  assert.equal(multiline.objective, '多行目标\n保留换行');
+  assert.equal((await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: '/goal pause' }] })).result.stopReason, 'end_turn');
+});
+
+test('推荐配置值独立于用户当前选择，结构化失败替代 JSON-RPC 错误', async t => {
+  const c = await client(t);
+  await c.request('initialize', { protocolVersion: 1,
+    clientCapabilities: { _meta: { jetbrains: { air: { version: 1,
+      capabilities: ['recommendedValue', 'sessionFailure'] } } } } });
+  const created = await c.request('session/new', { cwd: root, mcpServers: [] });
+  const model = created.result.configOptions.find(option => option.id === 'model');
+  const thinking = created.result.configOptions.find(option => option.id === 'thinking');
+  assert.equal(model._meta.jetbrains.air.recommendedValue, 'test/first');
+  assert.equal(thinking._meta.jetbrains.air.recommendedValue, 'medium');
+  const changed = await c.request('session/set_model', { sessionId: created.result.sessionId, modelId: 'other/first' });
+  assert.deepEqual(changed.result, {});
+  const options = c.records.filter(record => record.params?.update?.configOptions).at(-1).params.update.configOptions;
+  assert.equal(options.find(option => option.id === 'model').currentValue, 'other/first');
+  assert.equal(options.find(option => option.id === 'model')._meta.jetbrains.air.recommendedValue, 'test/first');
+  const failed = await c.request('session/prompt', { sessionId: created.result.sessionId,
+    prompt: [{ type: 'text', text: 'crash' }] });
+  assert.equal(failed.result.stopReason, 'end_turn');
+  assert.equal(failed.result._meta.jetbrains.air.sessionFailure.severity, 'error');
+  assert.equal(failed.result._meta.jetbrains.air.sessionFailure.category, 'connection');
+});
+
+test('命令发现、用量、状态、压缩、关闭和分叉', async t => {
+  const c = await client(t);
+  const initialized = await c.request('initialize', { protocolVersion: 1,
+    clientCapabilities: { session: { compaction: {} } } });
+  assert.deepEqual(initialized.result.agentCapabilities.sessionCapabilities,
+    { list: {}, resume: {}, close: {}, delete: {}, fork: {}, subagents: {} });
+  const created = await c.request('session/new', { cwd: root, mcpServers: [] });
+  const sid = created.result.sessionId;
+  await c.request('session/set_model', { sessionId: sid, modelId: 'other/first' });
+  await c.request('session/set_mode', { sessionId: sid, modeId: 'standard' });
+  const commands = c.records.find(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'available_commands_update').params.update.availableCommands;
+  assert.deepEqual(commands.map(command => command.name), ['status', 'compact', 'goal', 'fixture']);
+  assert.deepEqual(commands.find(command => command.name === 'compact').input,
+    { type: 'unstructured', hint: '可选摘要要求' });
+  assert.ok(commands.filter(command => command.input).every(command => command.input.type === 'unstructured'));
+  const initialUsage = c.records.find(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'usage_update').params.update;
+  assert.deepEqual(initialUsage, { sessionUpdate: 'usage_update', used: 123, size: 1000,
+    cost: { amount: 0.001, currency: 'USD' } });
+  assert.equal((await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: '/status' }] })).result.stopReason, 'end_turn');
+  assert.match(c.records.findLast(record => record.params?.update?.sessionUpdate === 'agent_message_chunk')
+    .params.update.content.text, /上下文：123 \/ 1000/);
+  assert.equal((await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: '/compact 保留代码修改' }] })).result.stopReason, 'end_turn');
+  const compactions = c.records.filter(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'compaction_update').map(record => record.params.update);
+  assert.deepEqual(compactions.map(update => update.status), ['in_progress', 'completed']);
+  assert.equal(compactions[0].compactionId, compactions[1].compactionId);
+  const forked = await c.request('session/fork', { sessionId: sid, cwd: root, mcpServers: [] });
+  assert.ok(forked.result.sessionId && forked.result.sessionId !== sid, JSON.stringify(forked));
+  assert.equal(forked.result.models.currentModelId, 'other/first');
+  assert.equal(forked.result.modes.currentModeId, 'standard');
+  const resumedSource = await c.request('session/resume', { sessionId: sid, cwd: root, mcpServers: [] });
+  assert.equal(resumedSource.result.models.currentModelId, 'other/first');
+  assert.equal(resumedSource.result.modes.currentModeId, 'standard');
+  assert.ok((await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: '原会话继续' }] })).result);
+  assert.ok((await c.request('session/prompt', { sessionId: forked.result.sessionId,
+    prompt: [{ type: 'text', text: '分叉继续' }] })).result);
+  assert.ok((await c.request('session/resume', { sessionId: sid, cwd: root, mcpServers: [] })).result);
+  assert.deepEqual((await c.request('session/close', { sessionId: forked.result.sessionId })).result, {});
+  assert.equal((await c.request('session/prompt', { sessionId: forked.result.sessionId,
+    prompt: [{ type: 'text', text: '已关闭' }] })).error.code, -32602);
+  assert.deepEqual((await c.request('session/close', { sessionId: 'missing' })).result, {});
+});
+
+for (const method of ['session/load', 'session/resume']) {
+  test(`${method} 自动更新空闲会话的 MCP 配置并保留历史和权限`, async t => {
+    const c = await client(t);
+    const sid = await session(c);
+    await c.request('session/set_model', { sessionId: sid, modelId: 'other/first' });
+    await c.request('session/set_mode', { sessionId: sid, modeId: 'standard' });
+    await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '保留历史' }] });
+    const mcpServers = [{ type: 'http', name: 'ide', url: 'http://localhost:10002/mcp', headers: [] }];
+    const start = c.records.length;
+    const loaded = await c.request(method, { sessionId: sid, cwd: root, mcpServers });
+    assert.equal(loaded.result?.models.currentModelId, 'other/first', JSON.stringify(loaded));
+    assert.equal(loaded.result.modes.currentModeId, 'standard');
+    assert.ok(loaded.result.modes.availableModes.some(mode => mode.id === 'standard'));
+    assert.ok(!c.records.slice(start, c.records.indexOf(loaded)).some(record => record.params?.sessionId === sid &&
+      record.params.update.sessionUpdate === 'current_mode_update'));
+    if (method === 'session/load') assert.ok(c.records.slice(start).some(record =>
+      record.params?.sessionId === sid && record.params.update.content?.text === '保留历史'));
+    const promptStart = c.records.length;
+    assert.equal((await c.request('session/prompt', { sessionId: sid,
+      prompt: [{ type: 'text', text: 'mcp' }] })).result?.stopReason, 'end_turn');
+    const config = c.records.slice(promptStart).find(record => record.params?.sessionId === sid &&
+      record.params.update.sessionUpdate === 'agent_message_chunk').params.update.content.text;
+    assert.deepEqual(JSON.parse(config).mcpServers, JSON.parse(JSON.stringify(convertMcp(mcpServers))));
+    assert.ok((await c.request(method, { sessionId: sid, cwd: root, mcpServers: [] })).result);
+  });
+}
+
+test('Air 分叉可更新 MCP 配置，源会话保留配置与模型权限', async t => {
+  const c = await client(t);
+  const oldMcp = [{ type: 'http', name: 'ide', url: 'http://localhost:10001/mcp', headers: [] }];
+  const newMcp = [{ type: 'http', name: 'ide', url: 'http://localhost:10002/mcp', headers: [] }];
+  const sid = await session(c, oldMcp);
+  await c.request('session/set_model', { sessionId: sid, modelId: 'other/first' });
+  await c.request('session/set_mode', { sessionId: sid, modeId: 'standard' });
+  await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '保存历史' }] });
+  assert.equal((await c.request('session/fork', { sessionId: sid, mcpServers: [{}] })).error?.code, -32602);
+  const forked = await c.request('session/fork', { sessionId: sid, cwd: root, mcpServers: newMcp });
+  assert.ok(forked.result?.sessionId, JSON.stringify(forked));
+  assert.equal(forked.result.models.currentModelId, 'other/first');
+  assert.equal(forked.result.modes.currentModeId, 'standard');
+  const childId = forked.result.sessionId;
+  for (const [sessionId, mcpServers] of [[sid, oldMcp], [childId, newMcp]]) {
+    const start = c.records.length;
+    assert.equal((await c.request('session/prompt', { sessionId,
+      prompt: [{ type: 'text', text: 'mcp' }] })).result?.stopReason, 'end_turn');
+    const config = c.records.slice(start).find(record => record.params?.sessionId === sessionId &&
+      record.params.update.sessionUpdate === 'agent_message_chunk').params.update.content.text;
+    assert.deepEqual(JSON.parse(config).mcpServers, JSON.parse(JSON.stringify(convertMcp(mcpServers))));
+    const resumed = await c.request('session/resume', { sessionId, cwd: root, mcpServers });
+    assert.equal(resumed.result?.models.currentModelId, 'other/first', JSON.stringify(resumed));
+    assert.equal(resumed.result.modes.currentModeId, 'standard');
+  }
+  // Air 可先通过历史发现打开无 MCP 的源会话，再为分叉提供当前 IDE 配置。
+  const discoverySource = (await c.request('session/new', { cwd: root, mcpServers: [] })).result.sessionId;
+  await c.request('session/prompt', { sessionId: discoverySource, prompt: [{ type: 'text', text: '历史发现' }] });
+  const messageId = c.records.find(record => record.params?.sessionId === discoverySource &&
+    record.params.update.sessionUpdate === 'agent_message_chunk').params.update.messageId;
+  assert.ok((await c.request('session/fork', { sessionId: discoverySource, cwd: root, mcpServers: newMcp,
+    _meta: { jetbrains: { air: { fork: { version: 1, messageId } } } } })).result?.sessionId);
+});
+
+test('删除历史会话并拒绝未知会话', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'pi-acp-delete-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const c = await client(t, false, directory);
+  const sid = await session(c);
+  await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '持久化' }] });
+  await c.request('session/close', { sessionId: sid });
+  assert.deepEqual((await c.request('session/delete', { sessionId: sid })).result, {});
+  assert.ok(!(await c.request('session/list', { cwd: root })).result.sessions.some(info => info.sessionId === sid));
+  assert.equal((await c.request('session/delete', { sessionId: sid })).error.code, -32602);
+});
+
+test('未协商压缩能力时仍可压缩但不发送草案事件', async t => {
+  const c = await client(t);
+  const sid = await session(c);
+  await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/compact' }] });
+  assert.ok(!c.records.some(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'compaction_update'));
+  assert.match(c.records.findLast(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'agent_message_chunk').params.update.content.text, /压缩完成/);
+});
+
+test('扩展表单交互通过 elicitation 桥接，并保留无能力时的取消行为', async () => {
+  const records = [];
+  const responses = [];
+  const agent = new Agent({ send: record => records.push(record) });
+  agent.clientCapabilities = { elicitation: { form: {} } };
+  const session = { id: 'ui', turn: {}, pi: { closed: false, send: response => responses.push(response) } };
+  const pending = agent.ui(session, { id: 'ui-1', method: 'select', title: '选择颜色', options: ['红', '蓝'] });
+  while (!records.length) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(records[0].method, 'elicitation/create');
+  assert.equal(records[0].params.message, '选择颜色');
+  assert.deepEqual(records[0].params.requestedSchema.properties.value.enum, ['红', '蓝']);
+  await agent.receive({ jsonrpc: '2.0', id: records[0].id, result: { action: 'accept', content: { value: '蓝' } } });
+  await pending;
+  assert.deepEqual(responses[0], { type: 'extension_ui_response', id: 'ui-1', value: '蓝' });
+  agent.clientCapabilities = {};
+  await agent.ui(session, { id: 'ui-2', method: 'input', title: '输入值' });
+  assert.deepEqual(responses.at(-1), { type: 'extension_ui_response', id: 'ui-2', cancelled: true });
+  agent.clientCapabilities = { elicitation: { form: {} } };
+  const requests = () => records.filter(record => record.method === 'elicitation/create');
+  const rejected = agent.ui(session, { id: 'ui-3', method: 'select', title: '严格选择', options: ['A'] });
+  while (requests().length < 2) await new Promise(resolve => setImmediate(resolve));
+  await agent.receive({ jsonrpc: '2.0', id: requests()[1].id,
+    result: { action: 'accept', content: { value: 'B' } } });
+  await rejected;
+  assert.deepEqual(responses.at(-1), { type: 'extension_ui_response', id: 'ui-3', cancelled: true });
+  const confirmed = agent.ui(session, { id: 'ui-4', method: 'confirm', title: '删除？', message: '所有数据将丢失' });
+  while (requests().length < 3) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests()[2].params.message, '删除？\n\n所有数据将丢失');
+  await agent.receive({ jsonrpc: '2.0', id: requests()[2].id,
+    result: { action: 'accept', content: { value: false } } });
+  await confirmed;
+  assert.deepEqual(responses.at(-1), { type: 'extension_ui_response', id: 'ui-4', confirmed: false });
+});
+
+test('扩展通知仅在 notice 能力协商后发送', async () => {
+  const updates = [];
+  const agent = new Agent({ send: record => updates.push(record.params.update) });
+  const session = { id: 'notice' };
+  await agent.ui(session, { method: 'notify', message: '需要注意', notifyType: 'warning' });
+  assert.equal(updates.length, 0);
+  agent.clientCapabilities = { session: { notices: {} } };
+  await agent.ui(session, { method: 'notify', message: '需要注意', notifyType: 'warning' });
+  assert.deepEqual(updates[0], { sessionUpdate: 'notice', severity: 'warning', title: '需要注意' });
+});
+
+test('未协商时忽略自定义指令，协商后校验并传给 pi 扩展', async t => {
+  const c = await client(t);
+  await c.request('initialize', { protocolVersion: 1,
+    clientCapabilities: { _meta: { jetbrains: { air: { version: 1,
+      capabilities: ['customInstructions'] } } } } });
+  const created = await c.request('session/new', { cwd: root, mcpServers: [],
+    _meta: { jetbrains: { air: { customInstructions: '只输出中文' } } } });
+  assert.ok(created.result?.sessionId, JSON.stringify(created));
+  const invalid = await c.request('session/new', { cwd: root, mcpServers: [],
+    _meta: { jetbrains: { air: { customInstructions: 123 } } } });
+  assert.equal(invalid.error.code, -32602);
+});
+
+test('Air 文件修改报告仅在协商并请求后发送，且先于 prompt 响应', async t => {
+  const c = await client(t);
+  await c.request('initialize', { protocolVersion: 1,
+    clientCapabilities: { _meta: { jetbrains: { air: { version: 1,
+      capabilities: ['agentFileChangeReport'] } } } } });
+  const created = await c.request('session/new', { cwd: root, mcpServers: [] });
+  const sid = created.result.sessionId;
+  const response = await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: 'permission' }],
+    _meta: { jetbrains: { air: { agentFileChangeReportRequest: { version: 1, requestId: 'turn-1' } } } } });
+  const reportRecord = c.records.find(record => record.params?.sessionId === sid &&
+    record.params.update._meta?.jetbrains?.air?.agentFileChangeReport?.requestId === 'turn-1');
+  assert.ok(reportRecord, JSON.stringify(c.records));
+  assert.deepEqual(reportRecord.params.update._meta.jetbrains.air.agentFileChangeReport, {
+    version: 1, requestId: 'turn-1', status: 'reported', paths: [root + 'a.txt'],
+    declaredComplete: false, truncated: false,
+    uncertainty: '包含内置 edit/write 报告及工作目录前后快照的文件变化（含命令、MCP、扩展）；不扫描 .git 和符号链接目标。无法区分外部并发修改，可能遗漏修改后恢复、目录外及轮次结束后的后台修改。',
+  });
+  assert.ok(c.records.indexOf(reportRecord) < c.records.indexOf(response));
+  const failed = await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: 'crash' }],
+    _meta: { jetbrains: { air: { agentFileChangeReportRequest: { version: 1, requestId: 'turn-failed' } } } } });
+  assert.ok(failed.error);
+  const failedReport = c.records.find(record => record.params?.update?._meta?.jetbrains?.air
+    ?.agentFileChangeReport?.requestId === 'turn-failed').params.update._meta.jetbrains.air.agentFileChangeReport;
+  assert.equal(failedReport.status, 'unavailable');
+  assert.equal(failedReport.reason, 'providerError');
+});
+
+test('终端工具按客户端能力发送累计输出增量和退出码', () => {
+  const records = [];
+  const agent = new Agent({ send: record => records.push(record.params.update) });
+  agent.clientCapabilities = { _meta: { terminal_output_delta: true } };
+  const session = { id: 'terminal', cwd: '/workspace', turn: {}, tools: new Map(), terminals: new Map() };
+  const call = { toolCallId: 'bash-1', toolName: 'bash', args: { command: 'printf test' } };
+  agent.event(session, { type: 'tool_execution_start', ...call });
+  assert.deepEqual(records[0].content, [{ type: 'terminal', terminalId: 'bash-1' }]);
+  agent.event(session, { type: 'tool_execution_update', ...call,
+    partialResult: { content: [{ type: 'text', text: 'te' }] } });
+  agent.event(session, { type: 'tool_execution_update', ...call,
+    partialResult: { content: [{ type: 'text', text: 'test' }] } });
+  agent.event(session, { type: 'tool_execution_end', ...call, isError: false,
+    result: { content: [{ type: 'text', text: 'test' }], structuredContent: { output: 'test', exit_code: 0 } } });
+  assert.equal(records[1]._meta.terminal_output_delta.data, 'te');
+  assert.equal(records[2]._meta.terminal_output_delta.data, 'st');
+  session.tools.set('bash-1', { title: 'bash' });
+  session.terminals.set('bash-1', 'abcdef');
+  const reset = agent.terminalUpdate(session, 'bash-1', { content: [{ type: 'text', text: 'defghi' }] });
+  assert.equal(reset._meta.terminal_output_delta.data, 'ghi');
+  session.terminals.set('bash-1', '前😀后');
+  const unicode = agent.terminalUpdate(session, 'bash-1', { content: [{ type: 'text', text: '😀后来' }] });
+  assert.equal(unicode._meta.terminal_output_delta.data, '来');
+  assert.equal(records[3]._meta.terminal_exit.exit_code, 0);
+  assert.deepEqual(records[3].content, []);
+});
+
+test('会话主动改名', async t => {
+  const c = await client(t);
+  const sid = await session(c);
+  assert.deepEqual((await c.request('_session/rename', { sessionId: sid, title: ' 主动标题 ' })).result, {});
+  const update = c.records.findLast(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'session_info_update');
+  assert.equal(update.params.update.title, '主动标题');
+  await c.request('session/close', { sessionId: sid });
+  assert.deepEqual((await c.request('_session/rename', { sessionId: sid, title: '关闭后改名' })).result, {});
+  const listed = await c.request('session/list', { cwd: root });
+  assert.equal(listed.result.sessions.find(info => info.sessionId === sid).title, '关闭后改名');
+  assert.equal((await c.request('_session/rename', { sessionId: sid, title: ' ' })).error.code, -32602);
 });
 
 test('IDEA 的 MCP 配置传入独立 pi 会话', async t => {
@@ -437,6 +1039,14 @@ for (const real of [false, true]) {
     assert.ok(all.result.sessions.some(info => info.sessionId === otherId));
     assert.equal((await c.request('session/list', { cwd: '.' })).error.code, -32602);
     assert.equal((await c.request('session/list', { cursor: 'invalid' })).error.code, -32602);
+    const page = await c.request('session/list', {
+      _meta: { jetbrains: { air: { list: { limit: 1 } } } } });
+    assert.equal(page.result.sessions.length, 1);
+    assert.equal(page.result.nextCursor, '1');
+    const secondPage = await c.request('session/list', { cursor: page.result.nextCursor,
+      _meta: { jetbrains: { air: { list: { limit: 1 } } } } });
+    assert.equal(secondPage.result.sessions.length, 1);
+    assert.notEqual(secondPage.result.sessions[0].sessionId, page.result.sessions[0].sessionId);
     assert.equal((await c.request('session/load', { sessionId: otherId, cwd: root, mcpServers: [] })).error.code, -32602);
     assert.equal((await c.request('session/load', { sessionId: '../history.jsonl', cwd: root, mcpServers: [] })).error.code, -32602);
     const loaded = await c.request('session/load', { sessionId: sid, cwd: root, mcpServers: [] });
@@ -444,8 +1054,10 @@ for (const real of [false, true]) {
     assert.ok(!('sessionId' in loaded.result));
     const updates = c.records.filter(record => record.params?.sessionId === sid).map(record => record.params.update);
     assert.deepEqual(updates.filter(update => update.content?.type === 'text').map(update => update.content.text), ['历史问题', '历史思考', '历史回答']);
-    assert.equal(updates[0].sessionUpdate, 'user_message_chunk');
-    assert.equal(updates[0].messageId, 'user');
+    const historyUpdates = updates.filter(update => ['user_message_chunk', 'agent_message_chunk', 'agent_thought_chunk',
+      'tool_call', 'tool_call_update'].includes(update.sessionUpdate));
+    assert.equal(historyUpdates[0].sessionUpdate, 'user_message_chunk');
+    assert.equal(historyUpdates[0].messageId, 'user');
     assert.ok(updates.some(update => update.sessionUpdate === 'session_info_update' && update.title === '历史会话标题'));
     assert.ok(updates.some(update => update.sessionUpdate === 'tool_call' && update.toolCallId === 'history-tool'));
     assert.ok(updates.some(update => update.status === 'completed' && update.content[0].content.text === '历史工具输出'));
@@ -461,11 +1073,303 @@ for (const real of [false, true]) {
   });
 }
 
+test('ACP v2 提示确认、排队取消、状态更新和稳定消息回放', async t => {
+  const c = await client(t);
+  const initialized = await c.request('initialize', { protocolVersion: 2,
+    info: { name: 'test-v2', version: '1' }, capabilities: {} });
+  assert.equal(initialized.result.protocolVersion, 2);
+  assert.equal(initialized.result.info.name, 'jetbrains-pi-acp');
+  assert.ok(initialized.result.capabilities.session.delete);
+  assert.equal(initialized.result._meta.steering.supported, false);
+  const created = await c.request('session/new', { cwd: root, mcpServers: [] });
+  const sid = created.result.sessionId;
+  assert.ok(created.result.configOptions.every(option => option.configId && !('id' in option)));
+  assert.ok(!('models' in created.result) && !('modes' in created.result));
+  const commands = c.records.find(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'available_commands_update').params.update.availableCommands;
+  assert.deepEqual(commands.find(command => command.name === 'compact').input,
+    { type: 'text', hint: '可选摘要要求' });
+  assert.ok(commands.filter(command => command.input).every(command => command.input.type === 'text'));
+  const first = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'wait' }] });
+  assert.equal(typeof first.result.messageId, 'string');
+  assert.ok(!('stopReason' in first.result));
+  await c.wait(record => record.params?.sessionId === sid && record.params.update.state === 'running');
+  c.send({ jsonrpc: '2.0', id: 1000, method: 'session/prompt', params: { sessionId: sid,
+    prompt: [{ type: 'text', text: '不应执行的排队消息' }] } });
+  c.send({ jsonrpc: '2.0', method: '$/cancel_request', params: { requestId: 1000 } });
+  const dropped = await c.wait(record => record.id === 1000 && !record.method);
+  assert.equal(dropped.error.code, -32800);
+  await c.request('session/cancel', { sessionId: sid });
+  await c.wait(record => record.params?.sessionId === sid && record.params.update.state === 'idle' &&
+    record.params.update.stopReason === 'cancelled');
+  const next = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '正常消息' }] });
+  assert.notEqual(next.result.messageId, first.result.messageId);
+  await c.wait(record => record.params?.sessionId === sid && record.params.update.state === 'idle' &&
+    record.params.update.stopReason === 'end_turn');
+  const answer = c.records.find(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'agent_message_chunk').params.update;
+  assert.equal(typeof answer.messageId, 'string');
+  const start = c.records.length;
+  const resumed = await c.request('session/resume', { sessionId: sid, cwd: root, replayFrom: { type: 'start' } });
+  assert.ok(resumed.result?.configOptions, JSON.stringify(resumed));
+  const replayed = c.records.slice(start).filter(record => record.params?.sessionId === sid).map(record => record.params.update);
+  assert.ok(replayed.some(update => update.sessionUpdate === 'user_message' && update.messageId === next.result.messageId));
+  assert.ok(replayed.some(update => update.sessionUpdate === 'agent_message_chunk' && update.messageId === answer.messageId));
+  assert.ok(!c.records.some(record => record.params?.update?.content?.text === '不应执行的排队消息'));
+  const changed = await c.request('session/set_config_option', { sessionId: sid, configId: 'model', type: 'id', value: 'other/first' });
+  assert.equal(changed.result.configOptions[0].currentValue, 'other/first');
+  assert.equal((await c.request('session/set_config_option', { sessionId: sid, configId: 'model', value: 'test/first' })).error.code, -32602);
+  assert.equal((await c.request('session/load', { sessionId: sid, cwd: root })).error.code, -32601);
+});
+
+test('ACP v2 授权使用 subject 并围绕等待发送状态', async t => {
+  const c = await client(t);
+  await c.request('initialize', { protocolVersion: 2, info: { name: 'test-v2', version: '1' } });
+  const sid = (await c.request('session/new', { cwd: root, mcpServers: [] })).result.sessionId;
+  await c.request('session/set_config_option', { sessionId: sid, configId: 'mode', type: 'id', value: 'standard' });
+  const accepted = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'permission' }] });
+  assert.ok(accepted.result.messageId);
+  const permission = await c.wait(record => record.method === 'session/request_permission');
+  assert.equal(permission.params.title, 'write');
+  assert.equal(permission.params.subject.type, 'tool_call');
+  assert.ok(!('toolCall' in permission.params));
+  assert.ok(c.records.some(record => record.params?.update?.state === 'requires_action'));
+  c.send({ jsonrpc: '2.0', id: permission.id, result: { outcome: { outcome: 'selected', optionId: 'allow-once' } } });
+  await c.wait(record => record.params?.sessionId === sid && record.params.update?.state === 'idle' &&
+    record.params.update.stopReason === 'end_turn');
+  assert.ok(!c.records.some(record => record.params?.update?.sessionUpdate === 'tool_call'));
+});
+
+test('ACP v2 完整会话流程、压缩摘要与跨进程回放', async t => {
+  const c = await client(t);
+  await c.request('initialize', { protocolVersion: 2, info: { name: 'test-v2', version: '1' } });
+  const sid = (await c.request('session/new', { cwd: root })).result.sessionId;
+  await c.wait(record => record.params?.sessionId === sid && record.params.update.state === 'idle');
+  assert.equal((await c.request('auth/login', { methodId: 'unknown' })).error.code, -32601);
+  let start = c.records.length;
+  const accepted = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '正常消息' }] });
+  await c.wait(record => c.records.indexOf(record) >= start && record.params?.sessionId === sid &&
+    record.params.update.state === 'idle' && record.params.update.stopReason === 'end_turn');
+  assert.ok((await c.request('session/list', { cwd: null, cursor: null })).result.sessions.some(info => info.sessionId === sid));
+  start = c.records.length;
+  await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/compact 保留接口' }] });
+  await c.wait(record => c.records.indexOf(record) >= start && record.params?.sessionId === sid && record.params.update.state === 'idle');
+  const completed = c.records.slice(start).find(record => record.params?.update?.sessionUpdate === 'compaction_update' &&
+    record.params.update.status === 'completed').params.update;
+  assert.deepEqual(completed.summary, [{ type: 'text', text: '保留接口' }]);
+  const forked = await c.request('session/fork', { sessionId: sid, cwd: root });
+  assert.ok(forked.result.sessionId !== sid && forked.result.configOptions);
+  await c.request('session/close', { sessionId: forked.result.sessionId });
+  await c.request('session/delete', { sessionId: forked.result.sessionId });
+  await c.request('session/close', { sessionId: sid });
+  const reopened = await client(t, false, c.directory);
+  await reopened.request('initialize', { protocolVersion: 2, info: { name: 'reopened', version: '1' } });
+  start = reopened.records.length;
+  assert.ok((await reopened.request('session/resume', { sessionId: sid, cwd: root, replayFrom: null })).result.configOptions);
+  assert.ok(!reopened.records.slice(start).some(record => record.params?.update?.sessionUpdate?.endsWith('_message_chunk')));
+  start = reopened.records.length;
+  assert.ok((await reopened.request('session/resume', { sessionId: sid, cwd: root, replayFrom: { type: 'start' } })).result.configOptions);
+  const replayed = reopened.records.slice(start).filter(record => record.params?.sessionId === sid).map(record => record.params.update);
+  assert.ok(replayed.some(value => value.sessionUpdate === 'user_message' && value.messageId === accepted.result.messageId));
+  assert.ok(replayed.some(value => value.sessionUpdate === 'compaction_update' && value.summary?.[0]?.text === '保留接口'));
+  start = reopened.records.length;
+  await reopened.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/compact 第二次摘要' }] });
+  await reopened.wait(record => reopened.records.indexOf(record) >= start && record.params?.sessionId === sid && record.params.update.state === 'idle');
+  const next = reopened.records.slice(start).find(record => record.params?.update?.sessionUpdate === 'compaction_update').params.update;
+  assert.notEqual(next.compactionId, completed.compactionId);
+  await reopened.request('session/delete', { sessionId: sid });
+  assert.ok(!(await reopened.request('session/list', { cwd: root })).result.sessions.some(info => info.sessionId === sid));
+});
+
+test('ACP v2 关闭会话先报告取消完成，且取消排队提示', async t => {
+  const c = await client(t);
+  await c.request('initialize', { protocolVersion: 2, info: { name: 'test-v2', version: '1' } });
+  const sid = (await c.request('session/new', { cwd: root })).result.sessionId;
+  await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'wait' }] });
+  c.send({ jsonrpc: '2.0', id: 1000, method: 'session/prompt', params: { sessionId: sid,
+    prompt: [{ type: 'text', text: '待关闭的排队消息' }] } });
+  const closed = await c.request('session/close', { sessionId: sid });
+  assert.ok(closed.result);
+  const dropped = await c.wait(record => record.id === 1000 && !record.method);
+  assert.equal(dropped.error.code, -32800);
+  const idle = c.records.find(record => record.params?.sessionId === sid && record.params.update.state === 'idle' &&
+    record.params.update.stopReason === 'cancelled');
+  assert.ok(idle && c.records.indexOf(idle) < c.records.indexOf(closed));
+  assert.ok(!c.records.some(record => record.params?.update?.content?.text === '待关闭的排队消息'));
+});
+
+test('ACP v2 认证登出先取消活动和排队提示，后续请求要求重新认证', async t => {
+  const c = await client(t);
+  await c.request('initialize', { protocolVersion: 2, info: { name: 'test-v2', version: '1' },
+    capabilities: { auth: { terminal: {} } } });
+  const sid = (await c.request('session/new', { cwd: root })).result.sessionId;
+  await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'wait' }] });
+  c.send({ jsonrpc: '2.0', id: 1000, method: 'session/prompt', params: { sessionId: sid,
+    prompt: [{ type: 'text', text: '待登出的排队消息' }] } });
+  const loggedOut = await c.request('auth/logout', {});
+  assert.deepEqual(loggedOut.result, {});
+  const dropped = await c.wait(record => record.id === 1000 && !record.method);
+  assert.equal(dropped.error.code, -32800);
+  const idle = c.records.find(record => record.params?.sessionId === sid && record.params.update.stopReason === 'cancelled');
+  assert.ok(idle && c.records.indexOf(idle) < c.records.indexOf(loggedOut));
+  const start = c.records.length;
+  const refused = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '登出后的消息' }] });
+  assert.equal(refused.error.code, -32000);
+  assert.ok(!c.records.slice(start).some(record => record.method === 'session/update'));
+});
+
+test('ACP v2 后端崩溃保留提示确认并报告结构化错误', async t => {
+  const c = await client(t);
+  await c.request('initialize', { protocolVersion: 2, info: { name: 'test-v2', version: '1' } });
+  const sid = (await c.request('session/new', { cwd: root })).result.sessionId;
+  const accepted = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'crash' }] });
+  assert.equal(typeof accepted.result.messageId, 'string');
+  const failed = await c.wait(record => record.params?.sessionId === sid && record.params.update.state === 'idle' &&
+    record.params.update.stopReason === 'error');
+  assert.equal(failed.params.update.error.code, -32603);
+  assert.match(failed.params.update.error.message, /退出/);
+  assert.equal(c.records.filter(record => record.id === accepted.id && !record.method).length, 1);
+});
+
 test('拒绝用 --no-session 禁用 ACP 会话持久化', async t => {
   const c = await client(t, false, undefined, ['--no-session']);
   await c.request('initialize', { protocolVersion: 1 });
   const created = await c.request('session/new', { cwd: root, mcpServers: [] });
   assert.match(created.error.message, /持久会话/);
+});
+
+test('本机 pi 文件 diff、写入快照及跨进程回放（显式启用，使用本地模型替身）', { skip: !process.env.PI_ACP_SMOKE }, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'pi-acp-file-diff-')));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const createdPath = join(directory, 'new.txt');
+  const overwrittenPath = join(directory, 'existing.txt');
+  const emptyPath = join(directory, 'empty.txt');
+  const binaryPath = join(directory, 'binary.txt');
+  const shellPath = join(directory, 'shell.txt');
+  await writeFile(overwrittenPath, '旧内容\r\n');
+  await writeFile(binaryPath, Buffer.from([65, 0, 66]));
+  const calls = [
+    { name: 'write', arguments: { path: createdPath, content: '你好\nold\n' } },
+    { name: 'write', arguments: { path: overwrittenPath, content: '新内容\r\n' } },
+    { name: 'edit', arguments: { path: createdPath, edits: [{ oldText: 'old', newText: 'new' }] } },
+    { name: 'edit', arguments: { path: createdPath, edits: [{ oldText: 'missing', newText: 'never' }] } },
+    { name: 'write', arguments: { path: emptyPath, content: '' } },
+    { name: 'write', arguments: { path: binaryPath, content: '覆盖二进制' } },
+    { name: 'bash', arguments: { command: `printf '命令生成' > '${shellPath.replaceAll("'", "'\\''")}'; printf '终端输出'` } },
+    { name: 'update_plan', arguments: { entries: [
+      { content: '验证修改和历史恢复', priority: 'high', status: 'completed' },
+    ] } },
+    [
+      { name: 'write', arguments: { path: createdPath, content: '并发写入一' } },
+      { name: 'write', arguments: { path: createdPath, content: '并发写入二' } },
+    ],
+  ];
+  const extension = join(directory, 'model.ts');
+  await writeFile(extension, `import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+  export default function (pi: any) {
+    const calls = ${JSON.stringify(calls)};
+    let step = 0;
+    pi.registerProvider('diff-test', {
+      api: 'diff-test-api', apiKey: 'test', baseUrl: 'http://localhost',
+      models: [{ id: 'mock', name: '文件 diff 测试模型', reasoning: false, input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+      streamSimple: (model: any) => {
+        const stream = createAssistantMessageEventStream();
+        const call = calls[step++];
+        const reason = call ? 'toolUse' : 'stop';
+        const message = { role: 'assistant',
+          content: call ? (Array.isArray(call) ? call : [call]).map((tool: any, index: number) =>
+            ({ type: 'toolCall', id: 'diff-' + step + '-' + index, ...tool })) : [{ type: 'text', text: '完成' }],
+          api: model.api, provider: model.provider, model: model.id, stopReason: reason, timestamp: Date.now(),
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+        stream.push({ type: 'done', reason, message });
+        stream.end();
+        return stream;
+      },
+    });
+  }`);
+  const extraArgs = ['--extension', extension, '--model', 'diff-test/mock'];
+  const c = await client(t, true, undefined, extraArgs);
+  const sid = await session(c, [], { _meta: { terminal_output_delta: true,
+    jetbrains: { air: { version: 1, capabilities: ['agentFileChangeReport'] } } } }, directory);
+  const response = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '验证文件修改' }],
+    _meta: { jetbrains: { air: { agentFileChangeReportRequest: { version: 1, requestId: 'real-files' } } } } });
+  assert.equal(response.result?.stopReason, 'end_turn', JSON.stringify(response));
+  const report = c.records.find(record => record.params?.update?._meta?.jetbrains?.air
+    ?.agentFileChangeReport?.requestId === 'real-files').params.update._meta.jetbrains.air.agentFileChangeReport;
+  assert.deepEqual(report.paths.sort(), [createdPath, overwrittenPath, emptyPath, binaryPath, shellPath].sort());
+  assert.equal(report.truncated, false);
+  const results = c.records.filter(record => record.params?.update?.rawOutput &&
+    ['completed', 'failed'].includes(record.params.update.status)).map(record => record.params.update);
+  assert.equal(results.length, 10);
+  const diffs = results.flatMap(update => update.content.filter(block => block.type === 'diff'));
+  assert.equal(results[5].status, 'completed');
+  assert.ok(!results[5].content.some(block => block.type === 'diff'));
+  const terminal = c.records.filter(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'tool_call' && record.params.update._meta?.terminal_info?.terminal_id).at(-1);
+  assert.deepEqual(terminal.params.update.content, [{ type: 'terminal', terminalId: terminal.params.update.toolCallId }]);
+  const terminalUpdates = c.records.filter(record => record.params?.sessionId === sid &&
+    record.params.update._meta?.terminal_output_delta);
+  assert.equal(terminalUpdates.map(record => record.params.update._meta.terminal_output_delta.data).join(''), '终端输出');
+  assert.equal(c.records.find(record => record.params?.sessionId === sid &&
+    record.params.update._meta?.terminal_exit).params.update._meta.terminal_exit.exit_code, 0);
+  const plan = c.records.find(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'plan').params.update;
+  assert.deepEqual(plan.entries, [{ content: '验证修改和历史恢复', priority: 'high', status: 'completed' }]);
+  const concurrentDiffs = results.slice(8).flatMap(update => update.content.filter(block => block.type === 'diff'));
+  // sequential 模式可准确捕获逐次写入；parallel 模式应弃用重叠快照。
+  if (concurrentDiffs.length) {
+    assert.deepEqual(concurrentDiffs.map(diff => [diff.oldText, diff.newText]), [
+      ['你好\nnew\n', '并发写入一'], ['并发写入一', '并发写入二'],
+    ]);
+  }
+  assert.equal(diffs.length, 4 + concurrentDiffs.length);
+  assert.deepEqual(diffs[0], { type: 'diff', path: createdPath, oldText: null, newText: '你好\nold\n' });
+  assert.deepEqual(diffs[1], { type: 'diff', path: overwrittenPath, oldText: '旧内容\r\n', newText: '新内容\r\n' });
+  assert.equal(diffs[2].newText, '你好\nnew\n');
+  assert.deepEqual(results[2].locations, [{ path: createdPath, line: 2 }]);
+  assert.equal(results[3].status, 'failed');
+  assert.ok(!results[3].content.some(block => block.type === 'diff'));
+  assert.deepEqual(diffs[3], { type: 'diff', path: emptyPath, oldText: null, newText: '' });
+  const reopened = await client(t, true, c.directory, extraArgs);
+  await reopened.request('initialize', { protocolVersion: 1 });
+  const loaded = await reopened.request('session/load', { sessionId: sid, cwd: directory, mcpServers: [] });
+  assert.ok(loaded.result, JSON.stringify(loaded));
+  const replayed = reopened.records.filter(record => record.params?.update?.rawOutput)
+    .flatMap(record => record.params.update.content.filter(block => block.type === 'diff'));
+  assert.deepEqual(replayed, diffs);
+  assert.deepEqual(reopened.records.find(record => record.params?.update?.sessionUpdate === 'plan')
+    .params.update, plan);
+  const v2 = await client(t, true, undefined, extraArgs);
+  const initialized = await v2.request('initialize', { protocolVersion: 2, info: { name: 'smoke-v2', version: '1' } });
+  assert.equal(initialized.result.protocolVersion, 2);
+  const v2sid = (await v2.request('session/new', { cwd: root, mcpServers: [] })).result.sessionId;
+  const accepted = await v2.request('session/prompt', { sessionId: v2sid,
+    prompt: [{ type: 'text', text: '验证 v2 实际工具' }] });
+  assert.equal(typeof accepted.result.messageId, 'string');
+  await v2.wait(record => record.params?.sessionId === v2sid &&
+    record.params.update?.state === 'idle' && record.params.update?.stopReason === 'end_turn');
+  const v2updates = v2.records.filter(record => record.method === 'session/update' &&
+    record.params.sessionId === v2sid).map(record => record.params.update);
+  const v2diffs = v2updates.flatMap(update => update.content ?? []).filter(block => block.type === 'diff');
+  assert.ok(v2diffs.length >= 2);
+  assert.ok(v2diffs.every(diff => diff.changes[0].path && diff.patch.format === 'git_patch' &&
+    diff.patch.text.startsWith('diff --git ') && !('oldText' in diff)));
+  assert.equal(v2updates.filter(update => update.sessionUpdate === 'terminal_output_chunk')
+    .map(update => Buffer.from(update.data, 'base64').toString('utf8')).join(''), '终端输出');
+  assert.ok(v2updates.some(update => update.sessionUpdate === 'terminal_update' && update.exitStatus?.exitCode === 0));
+  assert.ok(v2updates.some(update => update.sessionUpdate === 'plan_update' && update.plan.type === 'items'));
+  assert.ok(!v2updates.some(update => ['tool_call', 'plan', 'current_mode_update'].includes(update.sessionUpdate)));
+  const v2answer = v2updates.find(update => update.sessionUpdate === 'agent_message_chunk' && update.content.text === '完成');
+  assert.ok(v2answer?.messageId);
+  const beforeReplay = v2.records.length;
+  const v2loaded = await v2.request('session/resume', { sessionId: v2sid, cwd: root, replayFrom: { type: 'start' } });
+  assert.ok(v2loaded.result?.configOptions, JSON.stringify(v2loaded));
+  const v2replay = v2.records.slice(beforeReplay).filter(record => record.method === 'session/update')
+    .map(record => record.params.update);
+  assert.ok(v2replay.some(update => update.sessionUpdate === 'user_message' && update.messageId === accepted.result.messageId));
+  assert.ok(v2replay.some(update => update.sessionUpdate === 'agent_message_chunk' && update.messageId === v2answer.messageId));
 });
 
 test('新会话持久保存并可由另一个适配器发现和恢复', async t => {
@@ -478,3 +1382,279 @@ test('新会话持久保存并可由另一个适配器发现和恢复', async t 
   assert.ok((await reopened.request('session/load', { sessionId: sid, cwd: root, mcpServers: [] })).result);
   assert.ok(reopened.records.some(record => record.params?.update?.content?.text === '保存此问题'));
 });
+
+for (const real of [false, true]) {
+  test(`指定历史消息分叉保留整轮且源历史不变${real ? '（本机 pi）' : ''}`, { skip: real && !process.env.PI_ACP_SMOKE }, async t => {
+    const directory = await mkdtemp(join(tmpdir(), 'pi-acp-fork-point-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const args = real ? ['--session-dir', directory] : [];
+    const c = await client(t, real, directory, args);
+    await session(c, [], { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } });
+    const sid = randomUUID();
+    const timestamp = new Date().toISOString();
+    const user = (id, parentId, text) => ({ type: 'message', id, parentId, timestamp,
+      message: { role: 'user', content: text, timestamp: Date.now() } });
+    const answer = (id, parentId) => ({ type: 'message', id, parentId, timestamp,
+      message: { role: 'assistant', acpMessageId: `acp-${id}`, content: [{ type: 'text', text: '重复回答' }],
+        api: 'test', provider: 'test', model: 'first', stopReason: 'stop', timestamp: Date.now(),
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } });
+    const entries = [
+      { type: 'session', version: 3, id: sid, cwd: root, timestamp },
+      user('u1', null, '第一轮'), answer('abandoned', 'u1'),
+      { ...answer('a1', 'u1'), message: { ...answer('a1', 'u1').message, content: [
+        { type: 'text', text: '重复回答' }, { type: 'toolCall', id: 'read-1', name: 'read', arguments: { path: 'a.txt' } },
+      ] } },
+      { type: 'message', id: 'tool', parentId: 'a1', timestamp,
+        message: { role: 'toolResult', toolCallId: 'read-1', toolName: 'read', content: [{ type: 'text', text: '工具输出' }], isError: false } },
+      { type: 'custom', id: 'goal', parentId: 'tool', timestamp, customType: 'acp_goal',
+        data: { objective: '第一轮目标', status: 'active' } },
+      user('u2', 'goal', '第二轮'), answer('a2', 'u2'),
+      user('u3', 'a2', '第三轮'), answer('a3', 'u3'),
+    ];
+    const path = join(directory, 'source.jsonl');
+    let original = entries.map(entry => JSON.stringify(entry)).join('\n') + '\n';
+    await writeFile(path, original);
+    assert.ok((await c.request('session/resume', { sessionId: sid, cwd: root, mcpServers: [] })).result);
+    original = await readFile(path, 'utf8');
+    const fork = point => c.request('session/fork', { sessionId: sid, cwd: root, mcpServers: [],
+      _meta: { jetbrains: { air: { fork: { version: 1, ...point } } } } });
+    for (const messageId of ['missing', 'acp-abandoned', 'u1']) {
+      assert.equal((await fork({ messageId })).error?.code, -32602);
+      assert.equal(await readFile(path, 'utf8'), original);
+    }
+    const fingerprint = `sha256:${createHash('sha256').update('重复回答').digest('hex')}`;
+    assert.equal((await fork({ messageId: 'missing', messageFingerprint: fingerprint, messageOccurrence: 4 })).error?.code, -32602);
+    for (const [point, expected] of [
+      [{ messageId: 'acp-a1:segment:2' }, ['第一轮', '重复回答']],
+      [{ messageId: 'stale', messageFingerprint: fingerprint, messageOccurrence: 2 },
+        ['第一轮', '重复回答', '第二轮', '重复回答']],
+    ]) {
+      const result = await fork(point);
+      assert.ok(result.result?.sessionId && result.result.sessionId !== sid, JSON.stringify(result));
+      const childId = result.result.sessionId;
+      assert.equal(await readFile(path, 'utf8'), original);
+      await c.request('session/close', { sessionId: childId });
+      const start = c.records.length;
+      const loaded = await c.request('session/load', { sessionId: childId, cwd: root, mcpServers: [] });
+      assert.ok(loaded.result, JSON.stringify(loaded));
+      const replay = c.records.slice(start).filter(record => record.params?.sessionId === childId)
+        .map(record => record.params.update).filter(update =>
+          ['user_message_chunk', 'agent_message_chunk'].includes(update.sessionUpdate));
+      assert.deepEqual(replay.map(update => update.content.text), expected);
+      assert.equal(replay[1].messageId, 'acp-a1');
+      assert.ok(c.records.slice(start).some(record => record.params?.sessionId === childId &&
+        record.params.update.toolCallId === 'read-1' && record.params.update.status === 'completed'));
+      assert.ok(c.records.some(record => record.params?.sessionId === childId &&
+        record.params.update._meta?.jetbrains?.air?.goal?.objective === '第一轮目标'));
+    }
+    const start = c.records.length;
+    assert.ok((await c.request('session/load', { sessionId: sid, cwd: root, mcpServers: [] })).result);
+    assert.ok(c.records.slice(start).some(record => record.params?.update?.content?.text === '第三轮'));
+    if (!real) {
+      const childId = (await fork({ messageId: 'acp-a2' })).result.sessionId;
+      for (const sessionId of [sid, childId]) assert.equal((await c.request('session/prompt', {
+        sessionId, prompt: [{ type: 'text', text: '继续聊天' }],
+      })).result?.stopReason, 'end_turn');
+    }
+  });
+}
+
+for (const version of [1, 2]) {
+  test(`本机 pi ACP v${version} 子 agent、后台命令与定向停止（本地模型替身）`,
+    { skip: !process.env.PI_ACP_SMOKE }, async t => {
+      const directory = await realpath(await mkdtemp(join(tmpdir(), 'pi-acp-tasks-')));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const extension = join(directory, 'tasks-model.ts');
+      await writeFile(extension, `import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+      export default function (pi: any) {
+        pi.registerProvider('tasks-test', {
+          api: 'tasks-test-api', apiKey: 'test', baseUrl: 'http://localhost',
+          models: [{ id: 'mock', name: '任务测试模型', reasoning: false, input: ['text'],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+          streamSimple: (model: any, context: any) => {
+            const stream = createAssistantMessageEventStream();
+            const user = context.messages.filter((message: any) => message.role === 'user').at(-1);
+            const child = user?.content?.some((block: any) => block.text === '子任务');
+            const called = context.messages.some((message: any) => message.role === 'toolResult');
+            const content = !child && !called ? [
+              { type: 'toolCall', id: 'spawn-task', name: 'spawn_agent', arguments: { prompt: '子任务', name: '测试子 agent' } },
+              { type: 'toolCall', id: 'shell-task', name: 'background_shell', arguments: { command: 'printf 后台已启动; sleep 60' } },
+            ] : [{ type: 'text', text: child ? '子 agent 已完成' : '父任务已完成' }];
+            const reason = !child && !called ? 'toolUse' : 'stop';
+            const message = { role: 'assistant', content, api: model.api, provider: model.provider,
+              model: model.id, stopReason: reason, timestamp: Date.now(),
+              usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+            stream.push({ type: 'done', reason, message }); stream.end(); return stream;
+          },
+        });
+      }`);
+      const c = await client(t, true, undefined, ['--extension', extension, '--model', 'tasks-test/mock']);
+      const capabilities = { subagents: {}, _meta: { terminal_output_delta: true,
+        jetbrains: { air: { version: 1, capabilities: ['asyncTasks', 'nativeSubagentSessions'] } } } };
+      const initialized = await c.request('initialize', { protocolVersion: version,
+        ...(version === 1 ? { clientCapabilities: capabilities }
+          : { info: { name: 'tasks-test', version: '1' }, capabilities }) });
+      assert.ok(version === 1 ? initialized.result.agentCapabilities.sessionCapabilities.subagents
+        : initialized.result._meta.jetbrains.air.capabilities.includes('nativeSubagentSessions'));
+      const sid = (await c.request('session/new', { cwd: directory, mcpServers: [] })).result.sessionId;
+      const response = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '创建任务' }] });
+      assert.ok(!response.error, JSON.stringify(response));
+      const spawned = await c.wait(record => record.params?.update?.sessionUpdate === 'subagent_spawned');
+      const childId = spawned.params.update.subagentSessionId;
+      await c.wait(record => record.params?.update?.sessionUpdate === 'subagent_state_update' &&
+        record.params.update.state === 'completed');
+      assert.ok(c.records.some(record => record.params?.sessionId === childId &&
+        record.params.update.content?.text === '子 agent 已完成'));
+      const task = await c.wait(record => record.params?.update?.sessionUpdate === 'async_task_spawned');
+      const taskId = task.params.update.asyncTaskId;
+      const listed = await c.request('_session/async_task/list', { sessionId: sid });
+      assert.ok(listed.result.tasks.some(task => task.taskId === taskId && task.state === 'running'));
+      assert.deepEqual((await c.request('_session/async_task/stop', { sessionId: sid, asyncTaskId: taskId })).result,
+        { stopped: true });
+      assert.ok(c.records.some(record => record.params?.update?.sessionUpdate === 'async_task_state_update' &&
+        record.params.update.state === 'stopped'));
+      assert.equal((await c.request('session/prompt', { sessionId: sid,
+        prompt: [{ type: 'text', text: '继续父会话' }] })).error, undefined);
+      assert.deepEqual((await c.request('session/close', { sessionId: sid })).result, {});
+      const d = await client(t, true, c.directory, ['--extension', extension, '--model', 'tasks-test/mock']);
+      await d.request('initialize', { protocolVersion: 1, clientCapabilities: capabilities });
+      const reload = await d.request('session/load', { sessionId: sid, cwd: directory, mcpServers: [] });
+      assert.ok(reload.result, JSON.stringify(reload));
+      assert.ok(d.records.some(record => record.params?.update?.sessionUpdate === 'subagent_spawned' &&
+        record.params.update.subagentSessionId === childId));
+      assert.ok(d.records.some(record => record.params?.sessionId === childId &&
+        record.params.update.content?.text === '子 agent 已完成'));
+      const restored = (await d.request('_session/async_task/list', { sessionId: sid })).result.tasks;
+      assert.equal(restored.find(task => task.taskId === taskId).state, 'stopped');
+    });
+}
+
+test('本机 pi 扩展通过事件总线发起 URL 交互并确认完成', { skip: !process.env.PI_ACP_SMOKE }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'pi-acp-url-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const extension = join(directory, 'url.ts');
+  await writeFile(extension, `export default function (pi: any) {
+    const request = (event: string, params: any) => new Promise((resolve, reject) => {
+      pi.events.emit(event, { params, resolve, reject });
+    });
+    pi.registerCommand('urlcheck', {
+      description: '验证 URL 交互',
+      handler: async (_args: string, ctx: any) => {
+        const result: any = await request('acp:elicitation:url', {
+          url: 'https://example.com/connect', message: '请授权测试账号',
+        });
+        if (result.action === 'accept') {
+          const completed: any = await request('acp:elicitation:complete', { elicitationId: result.elicitationId });
+          ctx.ui.notify(completed.completed ? 'URL 完成已确认' : 'URL 完成未确认', 'info');
+        } else ctx.ui.notify('URL 交互已取消', 'info');
+      },
+    });
+  }`);
+  const c = await client(t, true, directory, ['--extension', extension, '--session-dir', directory]);
+  const sid = await session(c, [], { elicitation: { url: {} }, session: { notices: {} } });
+  const prompt = c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/urlcheck' }] });
+  const request = await c.wait(record => record.method === 'elicitation/create');
+  assert.equal(request.params.mode, 'url');
+  assert.equal(request.params.url, 'https://example.com/connect');
+  c.send({ jsonrpc: '2.0', id: request.id, result: { action: 'accept' } });
+  const complete = await c.wait(record => record.method === 'elicitation/complete');
+  assert.equal(complete.params.elicitationId, request.params.elicitationId);
+  await c.wait(record => record.params?.update?.title === 'URL 完成已确认');
+  assert.ok((await prompt).result);
+  await c.request('initialize', { protocolVersion: 1, clientCapabilities: {} });
+  const unsupported = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/urlcheck' }] });
+  assert.ok(unsupported.result);
+  assert.equal(c.records.filter(record => record.method === 'elicitation/create').length, 1);
+});
+
+for (const version of [1, 2]) {
+  test(`本机 pi ACP v${version} 扩展桥接、递归子树及崩溃恢复后台任务`,
+    { skip: !process.env.PI_ACP_SMOKE }, async t => {
+      const directory = await realpath(await mkdtemp(join(tmpdir(), 'pi-acp-task-tree-')));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const extension = join(directory, 'tree.ts');
+      await writeFile(extension, `import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+      import { Type } from 'typebox';
+      export default function (pi: any) {
+        pi.registerTool({ name: 'delegate', label: '委派', description: '通过桥接创建原生子会话',
+          parameters: Type.Object({}),
+          execute: async (toolCallId: string) => {
+            const result = await new Promise((resolve, reject) => pi.events.emit('acp:agent:spawn', {
+              toolCallId, params: { prompt: '中层', name: '桥接中层' }, resolve, reject,
+            }));
+            return { content: [{ type: 'text', text: JSON.stringify(result) }], details: result };
+          },
+        });
+        pi.registerProvider('tree-test', {
+          api: 'tree-test-api', apiKey: 'test', baseUrl: 'http://localhost',
+          models: [{ id: 'mock', name: '子树测试模型', reasoning: false, input: ['text'],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+          streamSimple: (model: any, context: any) => {
+            const stream = createAssistantMessageEventStream();
+            const user = context.messages.filter((message: any) => message.role === 'user').at(-1);
+            const level = user?.content?.some((block: any) => block.text === '叶子') ? 2
+              : user?.content?.some((block: any) => block.text === '中层') ? 1 : 0;
+            const called = context.messages.some((message: any) => message.role === 'toolResult');
+            const content = !called && level === 0 ? [
+              { type: 'toolCall', id: 'bridge-agent', name: 'delegate', arguments: {} },
+              { type: 'toolCall', id: 'durable-shell', name: 'background_shell',
+                arguments: { command: 'printf 存活; sleep 60' } },
+            ] : !called && level === 1 ? [
+              { type: 'toolCall', id: 'leaf-agent', name: 'spawn_agent', arguments: { prompt: '叶子' } },
+            ] : [{ type: 'text', text: level === 2 ? '叶子已完成' : level === 1 ? '中层已完成' : '根已完成' }];
+            const reason = content[0].type === 'toolCall' ? 'toolUse' : 'stop';
+            const message = { role: 'assistant', content, api: model.api, provider: model.provider,
+              model: model.id, stopReason: reason, timestamp: Date.now(),
+              usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+            stream.push({ type: 'done', reason, message }); stream.end(); return stream;
+          },
+        });
+      }`);
+      const args = ['--extension', extension, '--model', 'tree-test/mock'];
+      const capabilities = { subagents: {}, _meta: { terminal_output_delta: true,
+        jetbrains: { air: { version: 1, capabilities: ['asyncTasks', 'nativeSubagentSessions'] } } } };
+      const initialize = c => c.request('initialize', { protocolVersion: version,
+        ...(version === 1 ? { clientCapabilities: capabilities }
+          : { info: { name: 'tree-test', version: '1' }, capabilities }) });
+      const c = await client(t, true, undefined, args);
+      await initialize(c);
+      const sid = (await c.request('session/new', { cwd: directory, mcpServers: [] })).result.sessionId;
+      assert.equal((await c.request('session/prompt', { sessionId: sid,
+        prompt: [{ type: 'text', text: '创建树' }] })).error, undefined);
+      const middle = (await c.wait(record => record.params?.sessionId === sid &&
+        record.params.update.sessionUpdate === 'subagent_spawned')).params.update.subagentSessionId;
+      const leaf = (await c.wait(record => record.params?.sessionId === middle &&
+        record.params.update.sessionUpdate === 'subagent_spawned')).params.update.subagentSessionId;
+      await c.wait(record => record.params?.sessionId === sid && record.params.update.sessionUpdate === 'subagent_state_update' &&
+        record.params.update.state === 'completed');
+      const taskId = (await c.wait(record => record.params?.update?.sessionUpdate === 'async_task_spawned'))
+        .params.update.asyncTaskId;
+      await c.crash();
+      const d = await client(t, true, c.directory, args);
+      await initialize(d);
+      const loaded = await d.request(version === 1 ? 'session/load' : 'session/resume', {
+        sessionId: sid, cwd: directory, mcpServers: [], ...(version === 2 ? { replayFrom: { type: 'start' } } : {}),
+      });
+      assert.ok(loaded.result, JSON.stringify(loaded));
+      for (const [parentId, childId] of [[sid, middle], [middle, leaf]]) {
+        const spawn = d.records.findIndex(record => record.params?.sessionId === parentId &&
+          record.params.update.sessionUpdate === 'subagent_spawned' && record.params.update.subagentSessionId === childId);
+        const content = d.records.findIndex(record => record.params?.sessionId === childId &&
+          record.params.update.sessionUpdate === 'agent_message_chunk');
+        assert.ok(spawn >= 0 && content > spawn);
+        assert.ok(d.records.some(record => record.params?.sessionId === parentId &&
+          record.params.update.sessionUpdate === 'subagent_state_update' &&
+          record.params.update.subagentSessionId === childId && record.params.update.state === 'completed'));
+      }
+      const listed = (await d.request('_session/async_task/list', { sessionId: sid })).result.tasks;
+      assert.equal(listed.find(task => task.taskId === taskId).state, 'running');
+      assert.deepEqual((await d.request('_session/async_task/stop', { sessionId: sid, asyncTaskId: taskId })).result,
+        { stopped: true });
+      const stopped = (await d.request('_session/async_task/list', { sessionId: sid })).result.tasks.find(task => task.taskId === taskId);
+      assert.equal(stopped.state, 'stopped');
+      assert.equal(stopped.output, '存活');
+    });
+}

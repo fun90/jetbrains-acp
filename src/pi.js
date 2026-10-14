@@ -2,30 +2,46 @@ import { spawn } from 'node:child_process';
 import { readJsonl, writeJsonl } from './jsonl.js';
 
 export class PiProcess {
-  constructor({ command, args, cwd, configPath, onEvent, onFailure }) {
+  constructor({ command, args, cwd, configPath, onEvent, onFailure, onControl }) {
     this.pending = new Map();
     this.sequence = 0;
     this.closed = false;
     this.child = spawn(command, args, {
       cwd, env: { ...process.env, PI_ACP_CONFIG: configPath },
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
     });
     this.child.stderr.pipe(process.stderr, { end: false });
     this.child.stdin.on('error', error => this.fail(error, onFailure));
     this.child.on('error', error => this.fail(error, onFailure));
     this.child.on('exit', (code, signal) => {
-      this.fail(new Error(`pi 已退出（${signal ?? code}）`), onFailure);
+      this.fail(new Error(`pi 已退出（${signal ?? code}）`), error => {
+        if (!this.closing) onFailure(error);
+      });
     });
+    this.child.stdio[3].on('error', error => this.fail(error, onFailure));
+    readJsonl(this.child.stdio[3], record => {
+      if (record.type === 'acp_task_request') void onControl?.(record);
+      else this.response(record);
+    },
+      error => this.fail(new Error(`ACP 控制通道无效：${error.message}`), onFailure));
     readJsonl(this.child.stdout, record => {
-      if (record.type === 'response') {
-        const request = this.pending.get(record.id);
-        if (!request) return;
-        this.pending.delete(record.id);
-        clearTimeout(request.timer);
-        if (record.success) request.resolve(record.data);
-        else request.reject(new Error(record.error || 'pi 命令失败'));
-      } else onEvent(record);
+      if (record.type === 'response') this.response(record);
+      else onEvent(record);
     }, error => this.fail(new Error(`pi 输出无效：${error.message}`), onFailure));
+  }
+
+  controlResponse(id, data, error) {
+    if (!this.closed) writeJsonl(this.child.stdio[3], { type: 'acp_task_response', id,
+      success: !error, ...(error ? { error: error.message } : { data }) });
+  }
+
+  response(record) {
+    const request = this.pending.get(record.id);
+    if (!request) return;
+    this.pending.delete(record.id);
+    clearTimeout(request.timer);
+    if (record.success) request.resolve(record.data);
+    else request.reject(new Error(record.error || 'pi 命令失败'));
   }
 
   fail(error, onFailure) {
@@ -48,12 +64,18 @@ export class PiProcess {
   request(type, params = {}) {
     return new Promise((resolve, reject) => {
       const id = `pi-${++this.sequence}`;
+      const timeout = type === 'compact' ? 300000 : 30000;
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`pi 命令超时：${type}`));
-      }, 30000);
+      }, timeout);
       this.pending.set(id, { resolve, reject, timer });
-      try { this.send({ ...params, type, id }); }
+      try {
+        if (type === 'terminal_input' || type === 'acp_task_save') {
+          if (this.closed) throw new Error('pi 进程已关闭');
+          writeJsonl(this.child.stdio[3], { ...params, type, id });
+        } else this.send({ ...params, type, id });
+      }
       catch (error) {
         this.pending.delete(id);
         clearTimeout(timer);
@@ -63,6 +85,7 @@ export class PiProcess {
   }
 
   async close() {
+    this.closing = true;
     if (this.child.exitCode !== null || this.child.signalCode !== null) return;
     const exited = new Promise(resolve => this.child.once('exit', resolve));
     this.child.stdin.end();

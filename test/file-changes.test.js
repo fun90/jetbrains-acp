@@ -1,0 +1,119 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, mkdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Agent } from '../src/agent.js';
+import { changedFiles, fileSnapshot } from '../src/file-changes.js';
+
+test('工作目录快照覆盖新增、同大小修改、删除、重命名、二进制和忽略文件', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-acp-changes-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  for (const name of ['modified', 'deleted', 'renamed', 'unchanged']) await writeFile(join(cwd, name), '旧');
+  await writeFile(join(cwd, '.gitignore'), 'ignored/\n');
+  await mkdir(join(cwd, 'ignored'));
+  await mkdir(join(cwd, '.git'));
+  await writeFile(join(cwd, '.git', 'index'), '旧');
+  await utimes(join(cwd, 'modified'), new Date(0), new Date(0));
+  const before = await fileSnapshot(cwd);
+  await writeFile(join(cwd, 'modified'), '新');
+  await utimes(join(cwd, 'modified'), new Date(0), new Date(0));
+  await rm(join(cwd, 'deleted'));
+  await rename(join(cwd, 'renamed'), join(cwd, '新 文件'));
+  await writeFile(join(cwd, 'ignored', 'binary'), Buffer.from([0, 255]));
+  await writeFile(join(cwd, '.git', 'index'), '新');
+  const after = await fileSnapshot(cwd);
+  assert.equal(before.incomplete || after.incomplete, false);
+  assert.deepEqual(changedFiles(before, after).sort(),
+    ['modified', 'deleted', 'renamed', '新 文件', 'ignored/binary'].map(name => join(cwd, name)).sort());
+});
+
+test('符号链接不跟随到目录外，链接自身变化仍可报告', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'pi-acp-links-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const cwd = join(directory, 'project');
+  const outside = join(directory, 'outside');
+  await mkdir(cwd);
+  await mkdir(outside);
+  await symlink(outside, join(cwd, 'link'));
+  const before = await fileSnapshot(cwd);
+  await writeFile(join(outside, 'secret'), '目录外数据');
+  assert.deepEqual(changedFiles(before, await fileSnapshot(cwd)), []);
+  await rm(join(cwd, 'link'));
+  await symlink(join(outside, 'secret'), join(cwd, 'link'));
+  assert.deepEqual(changedFiles(before, await fileSnapshot(cwd)), [join(cwd, 'link')]);
+});
+
+test('扫描失败标记不完整，缺失项不误报新增或删除', async () => {
+  const missing = await fileSnapshot(join(tmpdir(), 'missing-' + randomUUID()));
+  assert.equal(missing.incomplete, true);
+  const before = { files: new Map([['/changed', '旧'], ['/deleted', '旧']]), incomplete: true };
+  const after = { files: new Map([['/changed', '新'], ['/added', '新']]), incomplete: true };
+  assert.deepEqual(changedFiles(before, after), ['/changed']);
+});
+
+test('扫描超过时限时保留不完整标记', async t => {
+  let calls = 0;
+  t.mock.method(Date, 'now', () => calls++ ? 2001 : 0);
+  const snapshot = await fileSnapshot(tmpdir());
+  assert.equal(snapshot.incomplete, true);
+  assert.equal(snapshot.files.size, 0);
+});
+
+test('快照失败不阻止执行，报告明确标注截断与不确定性', async () => {
+  const records = [];
+  const agent = new Agent({ send: record => records.push(record) });
+  const current = { id: 'missing', cwd: join(tmpdir(), 'missing-' + randomUUID()),
+    pi: { request: async () => ({ disposition: 'handled' }) } };
+  assert.deepEqual(await agent.prompt(current, { message: '/扩展命令' }, false, 'partial'), { stopReason: 'end_turn' });
+  const report = records.at(-1).params.update._meta.jetbrains.air.agentFileChangeReport;
+  assert.equal(report.status, 'reported');
+  assert.equal(report.truncated, true);
+  assert.match(report.uncertainty, /快照扫描未完成/);
+});
+
+test('文件报告覆盖命令、MCP、失败工具副作用及扩展命令，并隔离下一轮', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-acp-report-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await writeFile(join(cwd, 'existing'), '旧内容');
+  const records = [];
+  const agent = new Agent({ send: record => records.push(record) });
+  const current = { id: 'changes', cwd, tools: new Map(), terminals: new Map(), pi: {
+    request: async (type, prompt) => {
+      if (type === 'get_session_stats') return {};
+      if (prompt.message === '/扩展命令') {
+        await writeFile(join(cwd, 'extension'), '扩展生成');
+        return { disposition: 'handled' };
+      }
+      agent.event(current, { type: 'agent_start' });
+      if (prompt.message === '修改') {
+        for (const [toolName, mutate, isError] of [
+          ['bash', () => execFileSync(process.execPath, ['-e',
+            'require("node:fs").writeFileSync("existing", "命令修改")'], { cwd }), false],
+          ['mcp_write', () => writeFile(join(cwd, 'mcp'), 'MCP 生成'), false],
+          ['custom_failed', () => writeFile(join(cwd, 'failed'), '失败前已写入'), true],
+        ]) {
+          agent.event(current, { type: 'tool_execution_start', toolCallId: toolName, toolName, args: {} });
+          await mutate();
+          agent.event(current, { type: 'tool_execution_end', toolCallId: toolName, toolName,
+            isError, result: { content: [] } });
+        }
+      }
+      agent.event(current, { type: 'agent_settled' });
+      return { disposition: 'started' };
+    },
+  } };
+  await agent.prompt(current, { message: '修改' }, false, 'first');
+  const report = () => records.at(-1).params.update._meta.jetbrains.air.agentFileChangeReport;
+  assert.deepEqual(report().paths.sort(), ['existing', 'mcp', 'failed'].map(name => join(cwd, name)).sort());
+  assert.equal(report().declaredComplete, false);
+  assert.equal(report().truncated, false);
+  assert.equal(current.turn, null);
+  await agent.prompt(current, { message: '无变化' }, false, 'second');
+  assert.deepEqual(report().paths, []);
+  await agent.prompt(current, { message: '/扩展命令' }, false, 'third');
+  assert.equal(report().status, 'reported');
+  assert.deepEqual(report().paths, [join(cwd, 'extension')]);
+});

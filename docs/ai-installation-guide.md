@@ -25,7 +25,7 @@ IDEA MCP Server → ACP 转发 → Pi → 项目、代码、构建与调试工�
 - Pi 使用 `@earendil-works/pi-coding-agent`，以下命令安装 `1.2.0`。
 - Magpie 使用与目标 OS、CPU 匹配的官方发行包，配置目标账号可用的模型。
 - IntelliJ IDEA 与 Air 插件（ID `com.intellij.air`）需支持自定义 ACP；IDEA 需提供 MCP Server。
-- ACP 源码仓库：`https://github.com/fun90/jetbrains-pi-acp.git` ，无第三方依赖，无需构建。
+- ACP 源码仓库：`https://github.com/fun90/jetbrains-pi-acp.git` ，无需构建；源码安装后先运行 `npm ci`，默认使用随依赖安装的 pi。
 
 ## 1. 检测目标机器
 

@@ -1,10 +1,11 @@
+import { Socket } from 'node:net';
 import { readJsonl, writeJsonl } from '../src/jsonl.js';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 const option = name => process.argv.includes(name) ? process.argv[process.argv.lastIndexOf(name) + 1] : undefined;
 const directory = process.env.PI_CODING_AGENT_SESSION_DIR;
-const sessionPath = process.argv.includes('--session') ? option('--session') : join(directory, `${option('--session-id') || randomUUID()}.jsonl`);
+let sessionPath = process.argv.includes('--session') ? option('--session') : join(directory, `${option('--session-id') || randomUUID()}.jsonl`);
 let entries = process.argv.includes('--session') ? readFileSync(sessionPath, 'utf8').trim().split('\n').map(JSON.parse) : [
   { type: 'session', version: 3, id: process.argv.includes('--session-id') ? option('--session-id') : randomUUID(), cwd: process.cwd(), timestamp: new Date().toISOString() },
 ];
@@ -12,11 +13,26 @@ const persist = () => {
   if (!process.argv.includes('--no-session')) writeFileSync(sessionPath, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
 };
 const append = message => {
+  if (['user', 'assistant'].includes(message.role)) {
+    message = { ...message, acpMessageId: randomUUID() };
+    send({ type: 'extension_ui_request', method: 'notify', message: `PI_ACP_MESSAGE:${JSON.stringify({
+      role: message.role, id: message.acpMessageId,
+    })}` });
+  }
   entries.push({ type: 'message', id: randomUUID(), parentId: entries.length > 1 ? entries.at(-1).id : null,
     timestamp: new Date().toISOString(), message });
   persist();
 };
 const send = record => writeJsonl(process.stdout, record);
+const control = new Socket({ fd: 3, readable: true, writable: true });
+control.unref();
+readJsonl(control, request => {
+  if (request.type !== 'acp_task_save') return;
+  entries.push({ type: 'custom', id: randomUUID(), parentId: entries.at(-1)?.id ?? null,
+    timestamp: new Date().toISOString(), customType: 'acp_task', data: request.task });
+  persist();
+  writeJsonl(control, { type: 'response', id: request.id, success: true });
+});
 let permission;
 let waiting;
 let active = false;
@@ -41,6 +57,8 @@ const models = [{ provider: 'test', id: 'first', name: '第一个模型' },
   { provider: 'other', id: 'first', name: '同名模型' }];
 let model = models[0];
 let thinkingLevel = 'medium';
+let forkSequence = 0;
+let compactSequence = 0;
 const thinkingLevels = () => model.provider === 'other' ? ['off']
   : ['off', 'minimal', 'low', 'medium', 'high', ...(model.id === 'first' ? ['xhigh', 'max'] : [])];
 readJsonl(process.stdin, request => {
@@ -49,6 +67,55 @@ readJsonl(process.stdin, request => {
   else if (request.type === 'get_entries') response({ entries: entries.slice(1), leafId: entries.length > 1 ? entries.at(-1).id : null });
   else if (request.type === 'get_available_models') response({ models });
   else if (request.type === 'get_available_thinking_levels') response({ levels: thinkingLevels() });
+  else if (request.type === 'get_commands') response({ commands: [
+    { name: 'fixture', description: '测试命令', source: 'extension' },
+    { name: '__acp_check', description: '内部命令', source: 'extension' },
+  ] });
+  else if (request.type === 'get_session_stats') response({ sessionId: entries[0].id,
+    userMessages: entries.filter(entry => entry.message?.role === 'user').length,
+    assistantMessages: entries.filter(entry => entry.message?.role === 'assistant').length,
+    toolCalls: entries.filter(entry => entry.message?.role === 'assistant').flatMap(entry => entry.message.content ?? []).filter(block => block.type === 'toolCall').length,
+    toolResults: entries.filter(entry => entry.message?.role === 'toolResult').length,
+    totalMessages: entries.filter(entry => entry.type === 'message').length,
+    tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15 }, cost: 0.001,
+    contextUsage: { tokens: 123 + compactSequence, contextWindow: 1000, percent: 12.3 } });
+  else if (request.type === 'compact') {
+    compactSequence++;
+    send({ type: 'compaction_start', reason: 'manual' });
+    const result = { summary: request.customInstructions || '摘要', firstKeptEntryId: entries.at(-1)?.id,
+      tokensBefore: 500, estimatedTokensAfter: 100 };
+    entries.push({ type: 'compaction', id: randomUUID(), parentId: entries.at(-1)?.id,
+      timestamp: new Date().toISOString(), ...result });
+    persist();
+    send({ type: 'compaction_end', reason: 'manual', result, aborted: false, willRetry: false });
+    response(result);
+  }
+  else if (request.type === 'clone' || (request.type === 'prompt' && request.message.startsWith('/__acp_fork '))) {
+    const oldPath = sessionPath;
+    const header = entries[0];
+    const id = randomUUID();
+    const nextPath = join(directory, `${id}.jsonl`);
+    let branch = entries.slice(1);
+    if (request.type === 'prompt') {
+      const byId = new Map(branch.map(entry => [entry.id, entry]));
+      branch = [];
+      for (let entry = byId.get(JSON.parse(request.message.slice('/__acp_fork '.length))); entry; entry = byId.get(entry.parentId)) branch.push(entry);
+      branch.reverse();
+    }
+    entries = [{ ...header, id, parentSession: oldPath }, ...branch];
+    sessionPath = nextPath;
+    forkSequence++;
+    writeFileSync(nextPath, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    response({ cancelled: false });
+  }
+  else if (request.type === 'set_session_name') {
+    const name = request.name.trim();
+    entries.push({ type: 'session_info', id: randomUUID(), parentId: entries.at(-1)?.id ?? null,
+      timestamp: new Date().toISOString(), name });
+    persist();
+    send({ type: 'session_info_changed', name });
+    response();
+  }
   else if (request.type === 'set_thinking_level') {
     thinkingLevel = request.level;
     send({ type: 'thinking_level_changed', level: thinkingLevel });
@@ -60,17 +127,43 @@ readJsonl(process.stdin, request => {
     response(model);
   }
   else if (request.type === 'prompt' && request.message === '/__acp_check') {
+    const goal = entries.findLast(entry => entry.type === 'custom' && entry.customType === 'acp_goal')?.data ?? null;
+    send({ type: 'extension_ui_request', method: 'notify', message: `PI_ACP_GOAL:${JSON.stringify(goal)}` });
     send({ type: 'extension_ui_request', method: 'notify', message: 'PI_ACP_READY' });
     response({ disposition: 'handled' });
   } else if (request.type === 'prompt' && request.message.startsWith('/__acp_list')) {
+    const arguments_ = request.message.slice('/__acp_list'.length).trim();
+    const options = arguments_.startsWith('{') ? JSON.parse(arguments_) : {
+      all: arguments_ === 'all', cwds: [process.cwd()],
+    };
     const sessions = readdirSync(directory).filter(file => file.endsWith('.jsonl')).map(file => {
       const path = join(directory, file);
       const saved = readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse);
       const header = saved[0];
       return { sessionId: header.id, cwd: header.cwd, title: saved.findLast(entry => entry.type === 'session_info')?.name || '测试会话',
-        updatedAt: saved.at(-1).timestamp, path };
-    }).filter(session => request.message.endsWith(' all') || resolve(session.cwd) === process.cwd());
+        updatedAt: saved.at(-1).timestamp, path,
+        parentSessionPath: header.parentSession,
+        archived: saved.findLast(entry => entry.type === 'custom' && entry.customType === 'acp_archive')?.data === true };
+    }).filter(session => options.all || options.cwds.some(cwd => resolve(session.cwd) === resolve(cwd)))
+      .map(({ parentSessionPath, ...session }, _, all) => {
+        const parent = all.find(candidate => candidate.path === parentSessionPath);
+        return { ...session, ...(parent ? { forkedFrom: parent.sessionId } : {}) };
+      });
     send({ type: 'extension_ui_request', method: 'notify', message: `PI_ACP_SESSIONS:${JSON.stringify(sessions)}` });
+    response({ disposition: 'handled' });
+  } else if (request.type === 'prompt' && request.message.startsWith('/__acp_archive ')) {
+    entries.push({ type: 'custom', id: randomUUID(), parentId: entries.at(-1)?.id ?? null,
+      timestamp: new Date().toISOString(), customType: 'acp_archive',
+      data: request.message.slice('/__acp_archive '.length) === 'true' });
+    persist();
+    response({ disposition: 'handled' });
+  } else if (request.type === 'prompt' && request.message.startsWith('/__acp_goal ')) {
+    entries.push({ type: 'custom', id: randomUUID(), parentId: entries.at(-1)?.id ?? null,
+      timestamp: new Date().toISOString(), customType: 'acp_goal',
+      data: JSON.parse(request.message.slice('/__acp_goal '.length)) });
+    persist();
+    response({ disposition: 'handled' });
+  } else if (request.type === 'prompt' && request.message.startsWith('/__acp_mode ')) {
     response({ disposition: 'handled' });
   } else if (request.type === 'prompt' && request.message.startsWith('/name ')) {
     const name = request.message.slice('/name '.length);
