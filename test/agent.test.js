@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { readJsonl, writeJsonl } from '../src/jsonl.js';
-import { convertMcp, convertPrompt } from '../src/agent.js';
+import { Agent, convertMcp, convertPrompt } from '../src/agent.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const fixture = fileURLToPath(new URL('../fixtures/pi.js', import.meta.url));
@@ -60,6 +60,7 @@ async function client(t, real = false, savedDirectory, extraArgs = []) {
 async function session(c, mcpServers = []) {
   const initialized = await c.request('initialize', { protocolVersion: 1 });
   assert.equal(initialized.result.protocolVersion, 1);
+  assert.deepEqual(initialized.result._meta.steering, { supported: true });
   assert.equal(initialized.result.agentCapabilities.loadSession, true);
   assert.deepEqual(initialized.result.agentCapabilities.sessionCapabilities.list, {});
   const created = await c.request('session/new', { cwd: root, mcpServers });
@@ -129,7 +130,7 @@ test('会话改名推送到 ACP 并更新历史列表，清除名称发送 null'
   }
 });
 
-test('本机 pi 首轮结束自动命名及扩展改名同步到 ACP（显式启用，使用本地模型替身）', { skip: !process.env.PI_ACP_SMOKE }, async t => {
+test('本机 pi 自动命名、扩展改名及 steering（显式启用，使用本地模型替身）', { skip: !process.env.PI_ACP_SMOKE }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'pi-acp-title-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const extension = join(directory, 'title.ts');
@@ -139,14 +140,26 @@ test('本机 pi 首轮结束自动命名及扩展改名同步到 ACP（显式启
       api: 'title-test-api', apiKey: 'test', baseUrl: 'http://localhost',
       models: [{ id: 'mock', name: '标题测试模型', reasoning: false, input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 100 }],
-      streamSimple: (model: any) => {
+      streamSimple: (model: any, context: any) => {
         const stream = createAssistantMessageEventStream();
-        const message = { role: 'assistant', content: [{ type: 'text', text: '测试回答' }],
+        const input = context.messages.filter((message: any) => message.role === 'user').at(-1);
+        const text = input?.content?.some((block: any) => block.text === '等待引导') ? '等待引导已开始'
+          : input?.content?.some((block: any) => block.text === '补充约束') ? '已采纳补充约束' : '测试回答';
+        const message = { role: 'assistant', content: [{ type: 'text', text }],
           api: model.api, provider: model.provider, model: model.id, stopReason: 'stop', timestamp: Date.now(),
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-        stream.push({ type: 'done', reason: 'stop', message });
-        stream.end();
+        if (text === '等待引导已开始') {
+          stream.push({ type: 'start', partial: message });
+          stream.push({ type: 'text_delta', contentIndex: 0, delta: text, partial: message });
+          setTimeout(() => {
+            stream.push({ type: 'done', reason: 'stop', message });
+            stream.end();
+          }, 200);
+        } else {
+          stream.push({ type: 'done', reason: 'stop', message });
+          stream.end();
+        }
         return stream;
       },
     });
@@ -172,6 +185,17 @@ test('本机 pi 首轮结束自动命名及扩展改名同步到 ACP（显式启
   const update = await c.wait(record => record.params?.update?.title === '本机扩展标题');
   assert.equal(update.params.sessionId, sid);
   assert.equal(update.params.update.title, '本机扩展标题');
+  const running = c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: '等待引导' }] });
+  await c.wait(record => record.params?.update?.content?.text === '等待引导已开始');
+  const injected = await c.request('_session/steering', { sessionId: sid,
+    prompt: [{ type: 'text', text: '补充约束' }] });
+  assert.deepEqual(injected.result, { outcome: 'injected' });
+  assert.equal((await running).result.stopReason, 'end_turn');
+  assert.ok(c.records.some(record => record.params?.update?.content?.text === '已采纳补充约束'));
+  const idle = await c.request('_session/steering', { sessionId: sid,
+    prompt: [{ type: 'text', text: '补充约束' }] });
+  assert.deepEqual(idle.result, { outcome: 'startedNewTurn' });
 });
 
 for (const option of ['allow-once', 'reject-once', 'cancel']) {
@@ -220,6 +244,93 @@ test('默认完全访问自动放行，标准访问允许本会话全部工具�
   // 切回完全访问应解除当前等待中的授权，而不是留下工具挂起。
   await c.request('session/set_mode', { sessionId: sid, modeId: 'full' });
   assert.equal((await third).result.stopReason, 'end_turn');
+});
+
+test('Air steering 注入文本和图片，原提示等待补充消息执行完成', async t => {
+  const c = await client(t);
+  const sid = await session(c);
+  const first = c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'wait' }] });
+  const prompt = [{ type: 'text', text: '补充要求' }, { type: 'image', mimeType: 'image/png', data: 'abc' }];
+  const [injected, second] = await Promise.all([
+    c.request('_session/steering', { sessionId: sid, prompt }),
+    c.request('_session/steering', { sessionId: sid, prompt: [{ type: 'text', text: '第二条补充' }] }),
+  ]);
+  assert.deepEqual(injected.result, { outcome: 'injected' });
+  assert.deepEqual(second.result, { outcome: 'injected' });
+  assert.ok(!c.records.some(record => record.result?.stopReason));
+  assert.equal((await first).result.stopReason, 'end_turn');
+  const chunk = c.records.find(record => record.params?.update?.content?.text?.includes('补充要求'));
+  assert.deepEqual(JSON.parse(chunk.params.update.content.text), convertPrompt(prompt));
+  const secondChunk = c.records.find(record => record.params?.update?.content?.text?.includes('第二条补充'));
+  assert.deepEqual(JSON.parse(secondChunk.params.update.content.text), { message: '第二条补充' });
+  assert.ok(c.records.indexOf(chunk) < c.records.indexOf(secondChunk));
+});
+
+test('空闲 steering 启动新回合，继续接收补充消息并可取消', async t => {
+  const c = await client(t);
+  const sid = await session(c);
+  assert.deepEqual((await c.request('_session/steering', { sessionId: sid,
+    prompt: [{ type: 'text', text: 'wait' }] })).result, { outcome: 'startedNewTurn' });
+  assert.deepEqual((await c.request('_session/steering', { sessionId: sid,
+    prompt: [{ type: 'text', text: 'hold' }] })).result, { outcome: 'injected' });
+  await c.request('session/cancel', { sessionId: sid });
+  const next = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '你好' }] });
+  assert.equal(next.result.stopReason, 'end_turn');
+  assert.ok(!c.records.some(record => record.params?.update?.content?.text?.includes('hold')));
+});
+
+test('取消清除尚未消费的 steering 并结束原提示', async t => {
+  const c = await client(t);
+  const sid = await session(c);
+  const first = c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'wait' }] });
+  assert.deepEqual((await c.request('_session/steering', { sessionId: sid,
+    prompt: [{ type: 'text', text: 'hold' }] })).result, { outcome: 'injected' });
+  await c.request('session/cancel', { sessionId: sid });
+  assert.equal((await first).result.stopReason, 'cancelled');
+  const next = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '你好' }] });
+  assert.equal(next.result.stopReason, 'end_turn');
+  assert.ok(!c.records.some(record => record.params?.update?.content?.text?.includes('hold')));
+});
+
+test('steering 参数校验、失败响应与回合结束竞态', async () => {
+  const updates = [];
+  const agent = new Agent({ send: record => updates.push(record) });
+  agent.initialized = true;
+  let release;
+  let submissions = 0;
+  const session = { id: 'test', turn: null, pi: { request: async () => {
+    if (++submissions === 1) {
+      agent.event(session, { type: 'agent_start' });
+      return { disposition: 'started' };
+    }
+    if (submissions === 2) {
+      agent.event(session, { type: 'agent_settled' });
+      return new Promise(resolve => { release = resolve; });
+    }
+    throw new Error('提交失败');
+  } } };
+  agent.sessions.set(session.id, session);
+  const params = { sessionId: session.id, prompt: [{ type: 'text', text: '继续' }] };
+  await assert.rejects(agent.dispatch('_session/steering', { ...params, prompt: [] }), /必须包含内容/);
+  await assert.rejects(agent.dispatch('_session/steering', { ...params, sessionId: 'missing' }), /会话不存在/);
+  let completed = false;
+  const first = agent.dispatch('session/prompt', params).then(result => { completed = true; return result; });
+  const steer = agent.dispatch('_session/steering', params);
+  // 等待第二条提交抵达可控的 RPC 替身。
+  while (!release) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(completed, false);
+  release({ disposition: 'started' });
+  assert.deepEqual(await steer, { outcome: 'startedNewTurn' });
+  assert.equal(completed, false);
+  assert.deepEqual(await agent.dispatch('_session/steering', params), { outcome: 'failed' });
+  assert.ok(session.turn);
+  agent.event(session, { type: 'agent_start' });
+  agent.event(session, { type: 'agent_settled' });
+  assert.equal((await first).stopReason, 'end_turn');
+  assert.equal(session.turn, null);
+  assert.deepEqual(await agent.dispatch('_session/steering', params), { outcome: 'failed' });
+  assert.equal(session.turn, null);
+  assert.match(updates.at(-1).params.update.content.text, /执行失败：提交失败/);
 });
 
 test('并发提示拒绝、取消和进程异常退出', async t => {

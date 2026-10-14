@@ -47,12 +47,15 @@ IDEA / Air 插件 ← ACP JSON-RPC / stdio → 本仓库适配器 ← RPC JSONL 
 | 推理级别 | 通过 `thought_level` 配置选项连接 pi 的推理设置；模型切换后刷新可用级别与实际值 |
 | 权限模式 | 默认完全访问，支持标准访问；同时兼容 `session/set_mode` 与 `session/set_config_option` |
 | `session/prompt` | 转发文本、内嵌图片、文本资源和资源引用 |
+| `_session/steering` | 按 Air 扩展约定接收执行中的补充提示，通过 pi steering 引导后续执行；空闲时启动新回合 |
 | `session/update` | 转发回答、思考内容、工具状态与工具输出；通过 `session_info_update` 同步 pi 会话名变更及恢复后的标题 |
 | `session/cancel` | 解除待授权请求、清空 pi 队列并中止执行 |
 | `session/request_permission` | pi 扩展在工具执行前阻塞，等待 IDEA 的授权结果 |
 | MCP | 转发 stdio 和 HTTP 配置；不支持 SSE |
 
-提示接收成功不等于执行完成。适配器等到 pi 的 `agent_settled` 才返回 `stopReason`；取消返回 `cancelled`，模型长度限制返回 `max_tokens`，模型或进程失败返回 JSON-RPC 错误。同一会话拒绝并发提示，不同会话相互独立。stdout 只输出 ACP JSONL，诊断写到 stderr。
+提示接收成功不等于执行完成。适配器等到 pi 的 `agent_settled` 才返回 `stopReason`；取消返回 `cancelled`，模型长度限制返回 `max_tokens`，模型或进程失败返回 JSON-RPC 错误。同一会话拒绝并发的普通提示，通过 `_session/steering` 接收补充要求，不同会话相互独立。stdout 只输出 ACP JSONL，诊断写到 stderr。
+
+初始化响应通过顶层 `_meta.steering.supported: true` 声明支持 Air steering。Air 在执行中发送的 `_session/steering` 复用普通提示的内容格式；适配器串行提交到 pi 的 `prompt`，并指定 `streamingBehavior: "steer"`。补充提示在当前助手回合的工具调用完成后、下一次模型调用前生效，不会立即打断正在执行的工具。响应 `outcome: "injected"` 表示已入队或被输入处理器处理；如果上一轮已经结束，则启动新回合并返回 `startedNewTurn`；提交失败返回 `failed`。原普通提示等待包括补充执行在内的真正完成，取消会清空未消费的补充消息。由 steering 启动的新回合继续通过 `session/update` 输出，执行错误也通过消息更新显示。
 
 启动会话时会检查 ACP 扩展是否加载成功；授权扩展不可用会导致会话创建失败。MCP 配置写入权限为 `0600` 的临时文件，在适配器退出时删除，不修改用户的 pi 配置。IDEA 传入的 MCP 由 pi 原生 MCP 扩展连接，需要保持该扩展启用。
 
@@ -70,11 +73,11 @@ IDEA / Air 插件 ← ACP JSON-RPC / stdio → 本仓库适配器 ← RPC JSONL 
 
 ```bash
 npm test
-# 使用本机 pi 验证实际启动与扩展握手，不调用模型：
+# 使用本机 pi 验证启动、扩展握手及本地模型替身 steering，不调用远端模型：
 PI_ACP_SMOKE=1 npm test
 ```
 
-自动测试使用可控的 pi RPC 替身，覆盖握手、流式输出、真正完成时机、授权允许/拒绝/取消、并发提示、进程退出、MCP 转换、Unicode JSONL 分帧及历史列表、分支回放、跨进程恢复。显式启用的本机 pi 验证还会在临时会话目录检查真实历史发现和恢复，不调用模型。
+自动测试使用可控的 pi RPC 替身，覆盖握手、流式输出、真正完成时机、授权允许/拒绝/取消、并发提示、steering 注入及回合结束竞态、取消清队列、进程退出、MCP 转换、Unicode JSONL 分帧及历史列表、分支回放、跨进程恢复。显式启用的本机 pi 验证还会使用本地模型替身验证执行中追加消息，并在临时会话目录检查真实历史发现和恢复，不调用远端模型。
 
 ## 当前边界
 
@@ -93,5 +96,6 @@ PI_ACP_SMOKE=1 npm test
 - [ACP 历史会话列表](https://agentclientprotocol.com/protocol/v1/session-list)
 - [ACP 提示回合与取消](https://agentclientprotocol.com/protocol/v1/prompt-turn)
 - [ACP 工具调用与授权](https://agentclientprotocol.com/protocol/v1/tool-calls)
+- [Air steering 扩展约定](https://github.com/agentclientprotocol/codex-acp/blob/main/docs/air-extensions.md#jetbrains-shared-keys)
 - [pi RPC 官方文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
 - [pi 扩展官方文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)

@@ -19,6 +19,23 @@ const append = message => {
 const send = record => writeJsonl(process.stdout, record);
 let permission;
 let waiting;
+let active = false;
+let queued = [];
+let timer;
+const finish = () => {
+  if (queued.length) {
+    const prompt = queued.shift();
+    append({ role: 'user', content: prompt.message });
+    send({ type: 'message_start', message: { role: 'assistant' } });
+    send({ type: 'message_update', assistantMessageEvent: {
+      type: 'text_delta', contentIndex: 0, delta: JSON.stringify(prompt),
+    } });
+    timer = setTimeout(finish, 80);
+  } else {
+    active = waiting = false;
+    send({ type: 'agent_settled', aborted: false });
+  }
+};
 const models = [{ provider: 'test', id: 'first', name: '第一个模型' },
   { provider: 'test', id: 'second', name: '第二个模型' },
   { provider: 'other', id: 'first', name: '同名模型' }];
@@ -62,7 +79,18 @@ readJsonl(process.stdin, request => {
     persist();
     send({ type: 'session_info_changed', name: name || undefined });
     response({ disposition: 'handled' });
+  } else if (request.type === 'prompt' && active && request.streamingBehavior === 'steer') {
+    queued.push({ message: request.message, ...(request.images ? { images: request.images } : {}) });
+    response({ disposition: 'queued' });
+    if (waiting && !permission && request.message !== 'hold') {
+      waiting = false;
+      timer = setTimeout(finish, 20);
+    }
   } else if (request.type === 'prompt') {
+    if (request.message === 'handled') { response({ disposition: 'handled' }); return; }
+    active = true;
+    response({ disposition: 'started' });
+    send({ type: 'agent_start' });
     append({ role: 'user', content: request.message });
     send({ type: 'message_start', message: { role: 'assistant' } });
     if (request.message === 'permission') {
@@ -72,7 +100,6 @@ readJsonl(process.stdin, request => {
         message: JSON.stringify({ toolCallId: 'call-1', toolName: 'write', args: { path: 'a.txt' } }) });
     } else if (request.message === 'wait') waiting = true;
     else if (request.message === 'crash') process.exit(2);
-    else if (request.message === 'handled') { response({ disposition: 'handled' }); return; }
     else {
       const text = request.message === 'mcp' ? readFileSync(process.env.PI_ACP_CONFIG, 'utf8')
         : request.message === 'model' ? `${model.provider}/${model.id}`
@@ -82,19 +109,22 @@ readJsonl(process.stdin, request => {
       send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop' } });
       // 故意先结束低层运行，稍后才报告真正完成。
       send({ type: 'agent_end', willRetry: true });
-      setTimeout(() => send({ type: 'agent_settled', aborted: false }), 80);
+      timer = setTimeout(finish, 80);
     }
-    response({ disposition: 'started' });
   } else if (request.type === 'extension_ui_response' && permission) {
     permission = false;
     send({ type: 'tool_execution_end', toolCallId: 'call-1', toolName: 'write', isError: !request.confirmed,
       result: { content: [{ type: 'text', text: request.confirmed ? '已执行' : '已拒绝' }] } });
-    send({ type: 'agent_settled', aborted: !request.confirmed && !!request.cancelled });
-  } else if (request.type === 'clear_queue') response({ steering: [], followUp: [] });
+    finish();
+  } else if (request.type === 'clear_queue') {
+    response({ steering: queued.map(prompt => prompt.message), followUp: [] });
+    queued = [];
+  }
   else if (request.type === 'abort') {
+    clearTimeout(timer);
     response();
-    if (waiting || permission) {
-      waiting = permission = false;
+    if (active) {
+      active = waiting = permission = false;
       send({ type: 'agent_settled', aborted: true });
     }
   }

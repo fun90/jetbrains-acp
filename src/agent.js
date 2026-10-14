@@ -122,14 +122,15 @@ export class Agent {
       return { protocolVersion: 1, agentInfo: { name: 'pi-acp', title: 'pi', version: '0.1.0' },
         agentCapabilities: { loadSession: true, sessionCapabilities: { list: {} },
           promptCapabilities: { image: true, embeddedContext: true },
-          mcpCapabilities: { http: true, sse: false } }, authMethods: [] };
+          mcpCapabilities: { http: true, sse: false } }, authMethods: [],
+        _meta: { steering: { supported: true } } };
     }
     if (!this.initialized) throw invalid('请先 initialize');
     if (this.closing) throw new Error('适配器正在关闭');
     if (method === 'session/new') return this.newSession(params);
     if (method === 'session/list') return { sessions: (await this.listSessions(params)).map(({ path, ...info }) => info) };
     if (method === 'session/load') return this.loadSession(params);
-    if (!['session/prompt', 'session/cancel', 'session/set_model', 'session/set_config_option', 'session/set_mode'].includes(method)) {
+    if (!['session/prompt', '_session/steering', 'session/cancel', 'session/set_model', 'session/set_config_option', 'session/set_mode'].includes(method)) {
       throw Object.assign(new Error(`不支持的方法：${method}`), { code: -32601 });
     }
     const session = this.sessions.get(params.sessionId);
@@ -173,24 +174,63 @@ export class Agent {
       }
       return {};
     }
-    if (session.turn) throw invalid('该会话已有正在执行的提示');
+    const steering = method === '_session/steering';
+    if (session.turn && !steering) throw invalid('该会话已有正在执行的提示');
+    if (session.turn?.cancelled) throw invalid('会话正在取消，请稍后重试');
     if (session.changingConfig) throw invalid('配置正在切换，请稍后重试');
-    const prompt = convertPrompt(params.prompt);
-    let settle;
-    const completed = new Promise(resolve => { settle = resolve; });
-    const turn = { settle, cancelled: false, error: null, stopReason: 'end_turn' };
-    session.turn = turn;
-    try {
-      const accepted = await session.pi.request('prompt', prompt);
-      if (accepted?.disposition === 'handled') turn.settle();
-      await completed;
-      if (turn.cancelled) return { stopReason: 'cancelled' };
-      if (turn.error) throw turn.error;
-      return { stopReason: turn.stopReason };
-    } finally {
-      this.cancelPermissions(session);
-      session.turn = null;
+    return this.prompt(session, convertPrompt(params.prompt), steering);
+  }
+
+  async prompt(session, prompt, steering) {
+    const created = !session.turn;
+    if (created) {
+      let resolve;
+      const completed = new Promise(done => { resolve = done; });
+      const turn = { completed, pending: 0, starts: 0, settled: false,
+        cancelled: false, error: null, stopReason: 'end_turn' };
+      turn.finish = () => {
+        if (session.turn !== turn || !turn.settled || turn.pending) return;
+        this.cancelPermissions(session);
+        session.turn = null;
+        if (steering && turn.error && !turn.cancelled) {
+          this.update(session, { sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `\n执行失败：${turn.error.message}\n` } });
+        }
+        resolve();
+      };
+      turn.settle = () => { turn.settled = true; turn.finish(); };
+      session.turn = turn;
     }
+    const turn = session.turn;
+    turn.pending++;
+    // 串行提交，避免前一条提示尚在预处理时再次启动运行。
+    const submission = (turn.submission ?? Promise.resolve()).catch(() => {}).then(async () => {
+      if (turn.cancelled) throw invalid('会话正在取消，请稍后重试');
+      const starts = turn.starts;
+      const accepted = await session.pi.request('prompt', {
+        ...prompt, ...(steering ? { streamingBehavior: 'steer' } : {}),
+      });
+      if (accepted?.disposition === 'started' && turn.starts === starts) turn.settled = false;
+      if (accepted?.disposition === 'handled' && created) turn.settle();
+      return accepted;
+    });
+    turn.submission = submission;
+    let accepted;
+    try {
+      accepted = await submission;
+    } catch (error) {
+      if (created) { turn.error = error; turn.settle(); }
+      if (steering) return { outcome: 'failed' };
+      throw error;
+    } finally {
+      turn.pending--;
+      turn.finish();
+    }
+    if (steering) return { outcome: accepted?.disposition === 'started' ? 'startedNewTurn' : 'injected' };
+    await turn.completed;
+    if (turn.cancelled) return { stopReason: 'cancelled' };
+    if (turn.error) throw turn.error;
+    return { stopReason: turn.stopReason };
   }
 
   async listSessions(params) {
@@ -414,6 +454,10 @@ export class Agent {
     }
     if (!session.turn) return;
     switch (event.type) {
+      case 'agent_start':
+        session.turn.starts++;
+        session.turn.settled = false;
+        break;
       case 'message_start':
         if (event.message?.role === 'assistant') {
           session.blocks.clear();
