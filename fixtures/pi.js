@@ -1,5 +1,21 @@
 import { readJsonl, writeJsonl } from '../src/jsonl.js';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { join, resolve } from 'node:path';
+const option = name => process.argv.includes(name) ? process.argv[process.argv.lastIndexOf(name) + 1] : undefined;
+const directory = process.env.PI_CODING_AGENT_SESSION_DIR;
+const sessionPath = process.argv.includes('--session') ? option('--session') : join(directory, `${option('--session-id') || randomUUID()}.jsonl`);
+let entries = process.argv.includes('--session') ? readFileSync(sessionPath, 'utf8').trim().split('\n').map(JSON.parse) : [
+  { type: 'session', version: 3, id: process.argv.includes('--session-id') ? option('--session-id') : randomUUID(), cwd: process.cwd(), timestamp: new Date().toISOString() },
+];
+const persist = () => {
+  if (!process.argv.includes('--no-session')) writeFileSync(sessionPath, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+};
+const append = message => {
+  entries.push({ type: 'message', id: randomUUID(), parentId: entries.length > 1 ? entries.at(-1).id : null,
+    timestamp: new Date().toISOString(), message });
+  persist();
+};
 const send = record => writeJsonl(process.stdout, record);
 let permission;
 let waiting;
@@ -12,7 +28,8 @@ const thinkingLevels = () => model.provider === 'other' ? ['off']
   : ['off', 'minimal', 'low', 'medium', 'high', ...(model.id === 'first' ? ['xhigh', 'max'] : [])];
 readJsonl(process.stdin, request => {
   const response = data => send({ type: 'response', id: request.id, success: true, data });
-  if (request.type === 'get_state') response({ sessionId: 'fake', model, thinkingLevel });
+  if (request.type === 'get_state') response({ sessionId: entries[0].id, sessionFile: process.argv.includes('--no-session') ? undefined : sessionPath, model, thinkingLevel });
+  else if (request.type === 'get_entries') response({ entries: entries.slice(1), leafId: entries.length > 1 ? entries.at(-1).id : null });
   else if (request.type === 'get_available_models') response({ models });
   else if (request.type === 'get_available_thinking_levels') response({ levels: thinkingLevels() });
   else if (request.type === 'set_thinking_level') {
@@ -28,7 +45,18 @@ readJsonl(process.stdin, request => {
   else if (request.type === 'prompt' && request.message === '/__acp_check') {
     send({ type: 'extension_ui_request', method: 'notify', message: 'PI_ACP_READY' });
     response({ disposition: 'handled' });
+  } else if (request.type === 'prompt' && request.message.startsWith('/__acp_list')) {
+    const sessions = readdirSync(directory).filter(file => file.endsWith('.jsonl')).map(file => {
+      const path = join(directory, file);
+      const saved = readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse);
+      const header = saved[0];
+      return { sessionId: header.id, cwd: header.cwd, title: saved.find(entry => entry.type === 'session_info')?.name || '测试会话',
+        updatedAt: saved.at(-1).timestamp, path };
+    }).filter(session => request.message.endsWith(' all') || resolve(session.cwd) === process.cwd());
+    send({ type: 'extension_ui_request', method: 'notify', message: `PI_ACP_SESSIONS:${JSON.stringify(sessions)}` });
+    response({ disposition: 'handled' });
   } else if (request.type === 'prompt') {
+    append({ role: 'user', content: request.message });
     send({ type: 'message_start', message: { role: 'assistant' } });
     if (request.message === 'permission') {
       permission = true;
@@ -42,6 +70,7 @@ readJsonl(process.stdin, request => {
       const text = request.message === 'mcp' ? readFileSync(process.env.PI_ACP_CONFIG, 'utf8')
         : request.message === 'model' ? `${model.provider}/${model.id}`
           : request.message === 'thinking' ? thinkingLevel : '你好\u2028世界';
+      append({ role: 'assistant', content: [{ type: 'text', text }] });
       send({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: text } });
       send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop' } });
       // 故意先结束低层运行，稍后才报告真正完成。

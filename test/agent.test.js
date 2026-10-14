@@ -4,16 +4,21 @@ import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { readJsonl, writeJsonl } from '../src/jsonl.js';
 import { convertMcp, convertPrompt } from '../src/agent.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const fixture = fileURLToPath(new URL('../fixtures/pi.js', import.meta.url));
 
-async function client(t, real = false) {
+async function client(t, real = false, savedDirectory, extraArgs = []) {
+  const directory = savedDirectory ?? await mkdtemp(join(tmpdir(), 'pi-acp-test-'));
   const child = spawn(process.execPath, ['src/index.js', '--pi-command', real ? (process.env.PI_ACP_PI_COMMAND || 'pi') : process.execPath,
-    '--', ...(real ? ['--offline', '--no-extensions', '--no-skills', '--no-context-files', '--no-mcp'] : [fixture])],
-  { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
+    '--', ...(real ? ['--offline', '--no-extensions', '--no-skills', '--no-context-files', '--no-mcp'] : [fixture]), ...extraArgs],
+  { cwd: root, env: { ...process.env, PI_CODING_AGENT_SESSION_DIR: directory }, stdio: ['pipe', 'pipe', 'pipe'] });
   let stderr = '';
   child.stderr.on('data', data => { stderr += data; });
   const records = [];
@@ -47,13 +52,16 @@ async function client(t, real = false) {
     child.stdin.end();
     await exit;
     assert.equal(child.exitCode, 0, stderr);
+    if (!savedDirectory) await rm(directory, { recursive: true, force: true });
   });
-  return { child, records, request, send, wait };
+  return { child, records, request, send, wait, directory };
 }
 
 async function session(c, mcpServers = []) {
   const initialized = await c.request('initialize', { protocolVersion: 1 });
   assert.equal(initialized.result.protocolVersion, 1);
+  assert.equal(initialized.result.agentCapabilities.loadSession, true);
+  assert.deepEqual(initialized.result.agentCapabilities.sessionCapabilities.list, {});
   const created = await c.request('session/new', { cwd: root, mcpServers });
   assert.ok(created.result?.sessionId, JSON.stringify(created));
   assert.ok(created.result.models.availableModels.length > 0);
@@ -217,4 +225,79 @@ test('本机 pi 启动及扩展握手（显式启用，不调用模型）', { sk
   const value = thinking.options.at(-1).value;
   const changed = await c.request('session/set_config_option', { sessionId: sid, configId: 'thinking', value });
   assert.equal(changed.result.configOptions.find(option => option.id === 'thinking').currentValue, value);
+});
+
+for (const real of [false, true]) {
+  test(`历史列表、分支回放及跨进程恢复${real ? '（本机 pi）' : ''}`, { skip: real && !process.env.PI_ACP_SMOKE }, async t => {
+    const directory = await mkdtemp(join(tmpdir(), 'pi-acp-history-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const c = await client(t, real, real ? join(directory, 'unused') : directory, real ? ['--session-dir', directory] : []);
+    await session(c);
+    const sid = randomUUID();
+    const timestamp = new Date().toISOString();
+    const entries = [
+      { type: 'session', version: 3, id: sid, cwd: root, timestamp },
+      { type: 'message', id: 'user', parentId: null, timestamp, message: { role: 'user', content: '历史问题', timestamp: Date.now() } },
+      { type: 'message', id: 'old', parentId: 'user', timestamp, message: { role: 'assistant', content: [{ type: 'text', text: '放弃的分支' }] } },
+      { type: 'message', id: 'reply', parentId: 'user', timestamp, message: { role: 'assistant', content: [
+        { type: 'thinking', thinking: '历史思考' }, { type: 'text', text: '历史回答' },
+        { type: 'toolCall', id: 'history-tool', name: 'read', arguments: { path: 'a.txt' } },
+      ] } },
+      { type: 'message', id: 'tool', parentId: 'reply', timestamp, message: { role: 'toolResult', toolCallId: 'history-tool', toolName: 'read',
+        content: [{ type: 'text', text: '历史工具输出' }], isError: false } },
+      { type: 'session_info', id: 'name', parentId: 'tool', timestamp, name: '历史会话标题' },
+    ];
+    await writeFile(join(directory, 'history.jsonl'), entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    const otherId = randomUUID();
+    await writeFile(join(directory, 'other.jsonl'), JSON.stringify({ ...entries[0], id: otherId, cwd: tmpdir() }) + '\n');
+    const listed = await c.request('session/list', { cwd: root });
+    assert.ok(listed.result, JSON.stringify(listed));
+    const saved = listed.result.sessions.find(info => info.sessionId === sid);
+    assert.equal(saved.title, '历史会话标题');
+    assert.equal(saved.cwd, root);
+    assert.ok(!('path' in saved));
+    assert.ok(!listed.result.sessions.some(info => info.sessionId === otherId));
+    const all = await c.request('session/list', {});
+    assert.ok(all.result.sessions.some(info => info.sessionId === otherId));
+    assert.equal((await c.request('session/list', { cwd: '.' })).error.code, -32602);
+    assert.equal((await c.request('session/list', { cursor: 'invalid' })).error.code, -32602);
+    assert.equal((await c.request('session/load', { sessionId: otherId, cwd: root, mcpServers: [] })).error.code, -32602);
+    assert.equal((await c.request('session/load', { sessionId: '../history.jsonl', cwd: root, mcpServers: [] })).error.code, -32602);
+    const loaded = await c.request('session/load', { sessionId: sid, cwd: root, mcpServers: [] });
+    assert.ok(loaded.result?.configOptions, JSON.stringify(loaded));
+    assert.ok(!('sessionId' in loaded.result));
+    const updates = c.records.filter(record => record.params?.sessionId === sid).map(record => record.params.update);
+    assert.deepEqual(updates.filter(update => update.content?.type === 'text').map(update => update.content.text), ['历史问题', '历史思考', '历史回答']);
+    assert.equal(updates[0].sessionUpdate, 'user_message_chunk');
+    assert.equal(updates[0].messageId, 'user');
+    assert.ok(updates.some(update => update.sessionUpdate === 'tool_call' && update.toolCallId === 'history-tool'));
+    assert.ok(updates.some(update => update.status === 'completed' && update.content[0].content.text === '历史工具输出'));
+    assert.ok(c.records.indexOf(c.records.find(record => record.params?.sessionId === sid)) < c.records.indexOf(loaded));
+    assert.ok((await c.request('session/load', { sessionId: sid, cwd: root, mcpServers: [] })).result);
+    if (!real) {
+      assert.equal((await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '继续历史' }] })).result.stopReason, 'end_turn');
+      const restarted = await client(t, false, directory);
+      await restarted.request('initialize', { protocolVersion: 1 });
+      assert.ok((await restarted.request('session/load', { sessionId: sid, cwd: root, mcpServers: [] })).result);
+      assert.ok(restarted.records.some(record => record.params?.update?.content?.text === '继续历史'));
+    }
+  });
+}
+
+test('拒绝用 --no-session 禁用 ACP 会话持久化', async t => {
+  const c = await client(t, false, undefined, ['--no-session']);
+  await c.request('initialize', { protocolVersion: 1 });
+  const created = await c.request('session/new', { cwd: root, mcpServers: [] });
+  assert.match(created.error.message, /持久会话/);
+});
+
+test('新会话持久保存并可由另一个适配器发现和恢复', async t => {
+  const c = await client(t);
+  const sid = await session(c);
+  await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '保存此问题' }] });
+  const reopened = await client(t, false, c.directory);
+  await reopened.request('initialize', { protocolVersion: 1 });
+  assert.ok((await reopened.request('session/list', { cwd: root })).result.sessions.some(info => info.sessionId === sid));
+  assert.ok((await reopened.request('session/load', { sessionId: sid, cwd: root, mcpServers: [] })).result);
+  assert.ok(reopened.records.some(record => record.params?.update?.content?.text === '保存此问题'));
 });

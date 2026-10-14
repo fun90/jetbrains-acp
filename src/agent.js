@@ -120,13 +120,15 @@ export class Agent {
       if (!Number.isInteger(params.protocolVersion)) throw invalid('缺少 protocolVersion');
       this.initialized = true;
       return { protocolVersion: 1, agentInfo: { name: 'pi-acp', title: 'pi', version: '0.1.0' },
-        agentCapabilities: { loadSession: false,
+        agentCapabilities: { loadSession: true, sessionCapabilities: { list: {} },
           promptCapabilities: { image: true, embeddedContext: true },
           mcpCapabilities: { http: true, sse: false } }, authMethods: [] };
     }
     if (!this.initialized) throw invalid('请先 initialize');
     if (this.closing) throw new Error('适配器正在关闭');
     if (method === 'session/new') return this.newSession(params);
+    if (method === 'session/list') return { sessions: (await this.listSessions(params)).map(({ path, ...info }) => info) };
+    if (method === 'session/load') return this.loadSession(params);
     if (!['session/prompt', 'session/cancel', 'session/set_model', 'session/set_config_option', 'session/set_mode'].includes(method)) {
       throw Object.assign(new Error(`不支持的方法：${method}`), { code: -32601 });
     }
@@ -191,19 +193,102 @@ export class Agent {
     }
   }
 
-  async newSession(params) {
+  async listSessions(params) {
+    if (params.cursor !== undefined) throw invalid('不支持的会话列表游标');
+    const cwd = params.cwd ?? process.cwd();
+    const created = await this.newSession({ cwd, mcpServers: [] }, { discovery: true });
+    try {
+      await created.pi.request('prompt', { message: `/__acp_list${params.cwd === undefined ? ' all' : ''}` });
+      if (!created.history) throw new Error('pi 未返回历史会话列表');
+      return created.history;
+    } finally {
+      this.sessions.delete(created.id);
+      await created.pi.close();
+      await rm(created.directory, { recursive: true, force: true });
+    }
+  }
+
+  async loadSession(params) {
+    if (typeof params.sessionId !== 'string' || !params.sessionId) throw invalid('缺少 sessionId');
+    if (typeof params.cwd !== 'string' || !isAbsolute(params.cwd)) throw invalid('cwd 必须是绝对路径');
+    convertMcp(params.mcpServers);
+    const existing = this.sessions.get(params.sessionId);
+    if (existing && (existing.turn || existing.changingConfig || !existing.availableModels)) throw invalid('会话正在使用，请稍后重试');
+    if (existing && resolve(existing.cwd) !== resolve(params.cwd)) throw invalid('会话工作目录不匹配');
+    if (existing?.failure) throw existing.failure;
+    let result;
+    if (existing) result = this.sessionState(existing);
+    else {
+      const history = await this.listSessions({ cwd: params.cwd });
+      if (this.sessions.has(params.sessionId)) throw invalid('会话正在加载，请稍后重试');
+      const saved = history.find(session => session.sessionId === params.sessionId && resolve(session.cwd) === resolve(params.cwd));
+      if (!saved) throw invalid('当前目录中没有此历史会话');
+      result = await this.newSession(params, { id: saved.sessionId, path: saved.path });
+    }
+    const session = this.sessions.get(params.sessionId);
+    session.changingConfig = true;
+    try {
+      const { entries, leafId } = await session.pi.request('get_entries');
+      const byId = new Map(entries.map(entry => [entry.id, entry]));
+      const branch = [];
+      const seen = new Set();
+      for (let entry = byId.get(leafId); entry && !seen.has(entry.id); entry = byId.get(entry.parentId)) {
+        seen.add(entry.id);
+        branch.push(entry);
+      }
+      for (const entry of branch.reverse()) this.replay(session, entry);
+      const { sessionId, ...loaded } = result;
+      return loaded;
+    } catch (error) {
+      this.sessions.delete(session.id);
+      await session.pi.close();
+      await rm(session.directory, { recursive: true, force: true });
+      throw error;
+    } finally {
+      session.changingConfig = false;
+    }
+  }
+
+  replay(session, entry) {
+    const message = entry.type === 'message' ? entry.message : null;
+    if (!message) return;
+    if (message.role === 'toolResult') {
+      this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: message.toolCallId,
+        status: message.isError ? 'failed' : 'completed', content: this.content(message), rawOutput: message });
+      return;
+    }
+    if (!['user', 'assistant'].includes(message.role)) return;
+    const blocks = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content ?? [];
+    for (const block of blocks) {
+      if (block.type === 'toolCall' && message.role === 'assistant') {
+        this.update(session, { sessionUpdate: 'tool_call', ...this.tool(session, {
+          toolCallId: block.id, toolName: block.name, args: block.arguments,
+        }), status: 'pending' });
+      } else if (block.type === 'thinking' && message.role === 'assistant') {
+        this.update(session, { sessionUpdate: 'agent_thought_chunk', messageId: `${entry.id}:thinking`, content: { type: 'text', text: block.thinking } });
+      } else if (['text', 'image'].includes(block.type)) {
+        const content = block.type === 'text' ? { type: 'text', text: block.text }
+          : { type: 'image', data: block.data, mimeType: block.mimeType };
+        this.update(session, { sessionUpdate: message.role === 'user' ? 'user_message_chunk' : 'agent_message_chunk', messageId: entry.id, content });
+      }
+    }
+  }
+
+  async newSession(params, { id = randomUUID(), path, discovery = false } = {}) {
     if (typeof params.cwd !== 'string' || !isAbsolute(params.cwd)) throw invalid('cwd 必须是绝对路径');
     if (!(await stat(params.cwd)).isDirectory()) throw invalid('cwd 必须是目录');
     const mcpServers = convertMcp(params.mcpServers);
     const directory = await mkdtemp(join(tmpdir(), 'pi-acp-'));
     const configPath = join(directory, 'config.json');
-    const session = { id: randomUUID(), cwd: params.cwd, directory, mode: 'full', turn: null, tools: new Map(), blocks: new Map() };
+    const session = { id, cwd: params.cwd, directory, mode: 'full', turn: null, changingConfig: true, tools: new Map(), blocks: new Map() };
     this.sessions.set(session.id, session);
     try {
-      await writeFile(configPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
+      const sessionDirIndex = this.args.lastIndexOf('--session-dir');
+      await writeFile(configPath, JSON.stringify({ mcpServers,
+        sessionDir: sessionDirIndex === -1 ? undefined : this.args[sessionDirIndex + 1] }), { mode: 0o600 });
       if (this.closing) throw new Error('适配器正在关闭');
       session.pi = new PiProcess({ command: this.command,
-        args: [...this.args, '--mode', 'rpc', '--no-session', '--extension', extensionPath],
+        args: [...this.args, '--mode', 'rpc', ...(discovery ? ['--no-session'] : path ? ['--session', path] : ['--session-id', id]), '--extension', extensionPath],
         cwd: params.cwd, configPath,
         onEvent: event => this.event(session, event),
         onFailure: error => {
@@ -215,6 +300,8 @@ export class Agent {
       await session.pi.request('prompt', { message: '/__acp_check' });
       if (!session.ready) throw new Error('ACP 扩展未就绪，请使用 pi 1.1.0 或兼容版本');
       if (session.failure) throw session.failure;
+      if (discovery) return session;
+      if (state.sessionId !== id || !state.sessionFile) throw new Error('pi 未创建正确的持久会话，请移除会话选择或 --no-session 启动参数');
       const available = await session.pi.request('get_available_models');
       session.availableModels = available?.models ?? [];
       if (state?.model && !session.availableModels.some(model =>
@@ -226,19 +313,24 @@ export class Agent {
       if (!state?.model) await session.pi.request('set_model', { provider: current.provider, modelId: current.id });
       session.currentModelId = `${current.provider}/${current.id}`;
       await this.refreshThinking(session);
-      return { sessionId: session.id, configOptions: this.modelConfig(session),
-        modes: { currentModeId: session.mode, availableModes: modes }, models: {
-        currentModelId: session.currentModelId,
-        availableModels: session.availableModels.map(model => ({
-          modelId: `${model.provider}/${model.id}`, name: `${model.name || model.id} (${model.provider})`,
-        })),
-      } };
+      session.changingConfig = false;
+      return this.sessionState(session);
     } catch (error) {
       this.sessions.delete(session.id);
       await session.pi?.close();
       await rm(directory, { recursive: true, force: true });
       throw error;
     }
+  }
+
+  sessionState(session) {
+    return { sessionId: session.id, configOptions: this.modelConfig(session),
+      modes: { currentModeId: session.mode, availableModes: modes }, models: {
+        currentModelId: session.currentModelId,
+        availableModels: session.availableModels.map(model => ({
+          modelId: `${model.provider}/${model.id}`, name: `${model.name || model.id} (${model.provider})`,
+        })),
+      } };
   }
 
   setMode(session, modeId) {
@@ -373,6 +465,10 @@ export class Agent {
   }
 
   async ui(session, event) {
+    if (event.method === 'notify' && event.message?.startsWith('PI_ACP_SESSIONS:')) {
+      session.history = JSON.parse(event.message.slice('PI_ACP_SESSIONS:'.length));
+      return;
+    }
     if (event.method === 'notify' && event.message === 'PI_ACP_READY') {
       session.ready = true;
       return;

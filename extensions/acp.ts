@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
 
 // 由适配器创建的临时配置，避免覆盖用户或项目的 MCP 设置。
 export default function (pi: any) {
@@ -9,6 +10,19 @@ export default function (pi: any) {
   pi.registerCommand('__acp_check', {
     description: '检查 ACP 适配器连接',
     handler: async (_args: string, ctx: any) => ctx.ui.notify('PI_ACP_READY', 'info'),
+  });
+  pi.registerCommand('__acp_list', {
+    description: '列出 ACP 可恢复的 pi 会话',
+    handler: async (args: string, ctx: any) => {
+      const directory = config.sessionDir || process.env.PI_CODING_AGENT_SESSION_DIR ||
+        SettingsManager.create(ctx.cwd).getSessionDir();
+      const sessions = args === 'all' ? await SessionManager.listAll(directory)
+        : await SessionManager.list(ctx.cwd, directory);
+      ctx.ui.notify(`PI_ACP_SESSIONS:${JSON.stringify(sessions.map(session => ({
+        sessionId: session.id, cwd: session.cwd, title: session.name || session.firstMessage,
+        updatedAt: session.modified.toISOString(), path: session.path,
+      })))}`, 'info');
+    },
   });
   pi.on('tool_call', async (event: any, ctx: any) => {
     if (['read', 'grep', 'find', 'ls'].includes(event.toolName)) return;
