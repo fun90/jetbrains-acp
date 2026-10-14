@@ -109,6 +109,71 @@ test('初始化、错误、流式输出与真正完成时机', async t => {
     prompt: [{ type: 'text', text: 'handled' }] })).result.stopReason, 'end_turn');
 });
 
+test('会话改名推送到 ACP 并更新历史列表，清除名称发送 null', async t => {
+  const c = await client(t);
+  const sid = await session(c);
+  const other = await session(c);
+  for (const name of ['自动生成的会话名', '手动修改的会话名', '']) {
+    const response = await c.request('session/prompt', { sessionId: sid,
+      prompt: [{ type: 'text', text: `/name ${name}` }] });
+    assert.equal(response.result.stopReason, 'end_turn');
+    const updates = c.records.filter(record => record.params?.update?.sessionUpdate === 'session_info_update');
+    assert.equal(updates.at(-1).method, 'session/update');
+    assert.equal(updates.at(-1).params.sessionId, sid);
+    assert.deepEqual(updates.at(-1).params.update, { sessionUpdate: 'session_info_update', title: name || null });
+    assert.ok(!updates.some(record => record.params.sessionId === other));
+    if (name) {
+      const listed = await c.request('session/list', { cwd: root });
+      assert.equal(listed.result.sessions.find(info => info.sessionId === sid).title, name);
+    }
+  }
+});
+
+test('本机 pi 首轮结束自动命名及扩展改名同步到 ACP（显式启用，使用本地模型替身）', { skip: !process.env.PI_ACP_SMOKE }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'pi-acp-title-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const extension = join(directory, 'title.ts');
+  await writeFile(extension, `import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+  export default function (pi: any) {
+    pi.registerProvider('title-test', {
+      api: 'title-test-api', apiKey: 'test', baseUrl: 'http://localhost',
+      models: [{ id: 'mock', name: '标题测试模型', reasoning: false, input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 100 }],
+      streamSimple: (model: any) => {
+        const stream = createAssistantMessageEventStream();
+        const message = { role: 'assistant', content: [{ type: 'text', text: '测试回答' }],
+          api: model.api, provider: model.provider, model: model.id, stopReason: 'stop', timestamp: Date.now(),
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+        stream.push({ type: 'done', reason: 'stop', message });
+        stream.end();
+        return stream;
+      },
+    });
+    pi.on('agent_settled', () => { pi.setSessionName('首轮自动标题'); });
+    pi.registerCommand('__test_title', {
+      description: '验证会话改名事件',
+      handler: async (args: string) => { pi.setSessionName(args); },
+    });
+  }`);
+  const c = await client(t, true, undefined, ['--extension', extension, '--model', 'title-test/mock']);
+  const sid = await session(c);
+  const first = await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: '验证首轮自动命名' }] });
+  assert.equal(first.result.stopReason, 'end_turn');
+  const automatic = await c.wait(record => record.params?.update?.title === '首轮自动标题');
+  assert.equal(automatic.params.update.sessionUpdate, 'session_info_update');
+  assert.equal(automatic.params.sessionId, sid);
+  assert.ok(c.records.indexOf(automatic) < c.records.indexOf(first));
+  assert.equal(c.records.filter(record => record.params?.update?.title === '首轮自动标题').length, 1);
+  const response = await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: '/__test_title 本机扩展标题' }] });
+  assert.equal(response.result.stopReason, 'end_turn');
+  const update = await c.wait(record => record.params?.update?.title === '本机扩展标题');
+  assert.equal(update.params.sessionId, sid);
+  assert.equal(update.params.update.title, '本机扩展标题');
+});
+
 for (const option of ['allow-once', 'reject-once', 'cancel']) {
   test(`工具授权：${option}`, async t => {
     const c = await client(t);
@@ -270,6 +335,7 @@ for (const real of [false, true]) {
     assert.deepEqual(updates.filter(update => update.content?.type === 'text').map(update => update.content.text), ['历史问题', '历史思考', '历史回答']);
     assert.equal(updates[0].sessionUpdate, 'user_message_chunk');
     assert.equal(updates[0].messageId, 'user');
+    assert.ok(updates.some(update => update.sessionUpdate === 'session_info_update' && update.title === '历史会话标题'));
     assert.ok(updates.some(update => update.sessionUpdate === 'tool_call' && update.toolCallId === 'history-tool'));
     assert.ok(updates.some(update => update.status === 'completed' && update.content[0].content.text === '历史工具输出'));
     assert.ok(c.records.indexOf(c.records.find(record => record.params?.sessionId === sid)) < c.records.indexOf(loaded));

@@ -28,7 +28,7 @@ const thinkingLevels = () => model.provider === 'other' ? ['off']
   : ['off', 'minimal', 'low', 'medium', 'high', ...(model.id === 'first' ? ['xhigh', 'max'] : [])];
 readJsonl(process.stdin, request => {
   const response = data => send({ type: 'response', id: request.id, success: true, data });
-  if (request.type === 'get_state') response({ sessionId: entries[0].id, sessionFile: process.argv.includes('--no-session') ? undefined : sessionPath, model, thinkingLevel });
+  if (request.type === 'get_state') response({ sessionId: entries[0].id, sessionFile: process.argv.includes('--no-session') ? undefined : sessionPath, sessionName: entries.findLast(entry => entry.type === 'session_info')?.name, model, thinkingLevel });
   else if (request.type === 'get_entries') response({ entries: entries.slice(1), leafId: entries.length > 1 ? entries.at(-1).id : null });
   else if (request.type === 'get_available_models') response({ models });
   else if (request.type === 'get_available_thinking_levels') response({ levels: thinkingLevels() });
@@ -50,10 +50,17 @@ readJsonl(process.stdin, request => {
       const path = join(directory, file);
       const saved = readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse);
       const header = saved[0];
-      return { sessionId: header.id, cwd: header.cwd, title: saved.find(entry => entry.type === 'session_info')?.name || '测试会话',
+      return { sessionId: header.id, cwd: header.cwd, title: saved.findLast(entry => entry.type === 'session_info')?.name || '测试会话',
         updatedAt: saved.at(-1).timestamp, path };
     }).filter(session => request.message.endsWith(' all') || resolve(session.cwd) === process.cwd());
     send({ type: 'extension_ui_request', method: 'notify', message: `PI_ACP_SESSIONS:${JSON.stringify(sessions)}` });
+    response({ disposition: 'handled' });
+  } else if (request.type === 'prompt' && request.message.startsWith('/name ')) {
+    const name = request.message.slice('/name '.length);
+    entries.push({ type: 'session_info', id: randomUUID(), parentId: entries.at(-1).id,
+      timestamp: new Date().toISOString(), name });
+    persist();
+    send({ type: 'session_info_changed', name: name || undefined });
     response({ disposition: 'handled' });
   } else if (request.type === 'prompt') {
     append({ role: 'user', content: request.message });

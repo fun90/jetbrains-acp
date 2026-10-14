@@ -47,7 +47,7 @@ IDEA / Air 插件 ← ACP JSON-RPC / stdio → 本仓库适配器 ← RPC JSONL 
 | 推理级别 | 通过 `thought_level` 配置选项连接 pi 的推理设置；模型切换后刷新可用级别与实际值 |
 | 权限模式 | 默认完全访问，支持标准访问；同时兼容 `session/set_mode` 与 `session/set_config_option` |
 | `session/prompt` | 转发文本、内嵌图片、文本资源和资源引用 |
-| `session/update` | 转发回答、思考内容、工具状态与工具输出 |
+| `session/update` | 转发回答、思考内容、工具状态与工具输出；通过 `session_info_update` 同步 pi 会话名变更及恢复后的标题 |
 | `session/cancel` | 解除待授权请求、清空 pi 队列并中止执行 |
 | `session/request_permission` | pi 扩展在工具执行前阻塞，等待 IDEA 的授权结果 |
 | MCP | 转发 stdio 和 HTTP 配置；不支持 SSE |
@@ -59,6 +59,8 @@ IDEA / Air 插件 ← ACP JSON-RPC / stdio → 本仓库适配器 ← RPC JSONL 
 ## 历史会话
 
 适配器声明 `loadSession` 和 `sessionCapabilities.list` 能力，Air 可通过 `session/list` 发现已有 pi 会话，再通过 `session/load` 打开和继续。列表读取 pi 的原生存储，不复制会话到 IDEA；默认按 IDEA 当前项目的绝对 `cwd` 过滤，其他目录下的历史不会出现在该项目的列表中。
+
+安装在 pi 中的 `session-title` 扩展生成会话名后，适配器会实时推送给 Air；手动改名也使用同一通道。需要保持该扩展启用，Air 的实时刷新取决于其版本是否处理 ACP `session_info_update`。
 
 默认存储位置是 `~/.pi/agent/sessions/`；同时遵循 pi 的 `--session-dir`、`PI_CODING_AGENT_SESSION_DIR` 和 `sessionDir` 设置，以及 `PI_CODING_AGENT_DIR`。新聊天同样持久保存，可从终端 pi 恢复。之前由本适配器以 `--no-session` 创建的临时聊天没有历史文件，无法补回。
 

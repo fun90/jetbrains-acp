@@ -237,6 +237,8 @@ export class Agent {
         branch.push(entry);
       }
       for (const entry of branch.reverse()) this.replay(session, entry);
+      const state = await session.pi.request('get_state');
+      if (state.sessionName) this.update(session, { sessionUpdate: 'session_info_update', title: state.sessionName });
       const { sessionId, ...loaded } = result;
       return loaded;
     } catch (error) {
@@ -385,6 +387,10 @@ export class Agent {
   }
 
   event(session, event) {
+    if (event.type === 'session_info_changed') {
+      this.update(session, { sessionUpdate: 'session_info_update', title: event.name ?? null });
+      return;
+    }
     if (event.type === 'thinking_level_changed' && session.thinkingLevels && !session.changingConfig) {
       session.thinkingLevel = event.level;
       this.update(session, { sessionUpdate: 'config_option_update', configOptions: this.modelConfig(session) });
