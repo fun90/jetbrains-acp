@@ -5,7 +5,7 @@
 在目标机器上安装并连通以下链路：
 
 ```text
-IDEA 的 Air 插件 → jetbrains-acp（本仓库）→ Pi → Magpie → 模型提供商
+IDEA 的 Air 插件 → jetbrains-pi-acp（本仓库）→ Pi → Magpie → 模型提供商
 IDEA MCP Server → ACP 转发 → Pi → 项目、代码、构建与调试工具
 ```
 
@@ -25,7 +25,7 @@ IDEA MCP Server → ACP 转发 → Pi → 项目、代码、构建与调试工�
 - Pi 使用 `@earendil-works/pi-coding-agent`，以下命令安装 `1.2.0`。
 - Magpie 使用与目标 OS、CPU 匹配的官方发行包，配置目标账号可用的模型。
 - IntelliJ IDEA 与 Air 插件（ID `com.intellij.air`）需支持自定义 ACP；IDEA 需提供 MCP Server。
-- ACP 源码仓库：`https://github.com/fun90/jetbrains-acp.git`，无第三方依赖，无需构建。
+- ACP 源码仓库：`https://github.com/fun90/jetbrains-pi-acp.git` ，无第三方依赖，无需构建。
 
 ## 1. 检测目标机器
 
@@ -183,12 +183,12 @@ pi --model 'magpie/实际模型ID' --no-session --no-tools --print '只回复：
 
 ## 6. 安装 ACP 适配器并生成 IDEA 配置
 
-选择目标机器的源码目录，以下使用 `~/code/jetbrains-acp`：
+选择目标机器的源码目录，以下使用 `~/code/jetbrains-pi-acp`：
 
 ```bash
 mkdir -p "$HOME/code"
-git clone https://github.com/fun90/jetbrains-acp.git "$HOME/code/jetbrains-acp"
-cd "$HOME/code/jetbrains-acp"
+git clone https://github.com/fun90/jetbrains-pi-acp.git "$HOME/code/jetbrains-pi-acp"
+cd "$HOME/code/jetbrains-pi-acp"
 npm test
 npm run --silent config
 ```
@@ -211,7 +211,7 @@ npm run --silent config -- /目标机器上的绝对路径/pi
     "Pi": {
       "command": "/目标机器/node",
       "args": [
-        "/目标机器/jetbrains-acp/src/index.js",
+        "/目标机器/jetbrains-pi-acp/src/index.js",
         "--pi-command",
         "/目标机器/pi"
       ],
