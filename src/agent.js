@@ -1609,7 +1609,7 @@ export class Agent {
       return;
     }
     const call = JSON.parse(event.message);
-    if (!session.turn || session.turn.cancelled) {
+    if (session.turn?.cancelled) {
       session.pi.send({ type: 'extension_ui_response', id: event.id, cancelled: true });
       return;
     }
@@ -1623,6 +1623,10 @@ export class Agent {
       }
       session.pi.send({ type: 'extension_ui_response', id: event.id, confirmed: true });
       this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: call.toolCallId, status: 'in_progress' });
+      return;
+    }
+    if (!session.turn) {
+      session.pi.send({ type: 'extension_ui_response', id: event.id, cancelled: true });
       return;
     }
     const tool = session.tools.get(call.toolCallId) ?? this.tool(session, call);

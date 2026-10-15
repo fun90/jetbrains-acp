@@ -1,6 +1,6 @@
 # 发布到 npm 与 ACP Registry
 
-当前发布版本为 `0.1.0`，包名和 Registry ID 均为 `jetbrains-pi-acp`。这些文件只是待发布材料，不代表 npm 发布或 Registry 收录已经完成。
+以下发布命令以 `0.1.1` 为例，包名和 Registry ID 均为 `jetbrains-pi-acp`。实际发布与收录状态以 npm 和 [Registry PR](https://github.com/agentclientprotocol/registry/pull/691) 为准。
 
 ## 发布前验证
 
@@ -21,7 +21,7 @@ npm pack
 在项目外的空目录安装生成的压缩包，再通过安装后的命令验证，避免错误地使用源码或全局 pi：
 
 ```bash
-npm install /绝对路径/jetbrains-pi-acp/jetbrains-pi-acp-0.1.0.tgz
+npm install /绝对路径/jetbrains-pi-acp/jetbrains-pi-acp-0.1.1.tgz
 ./node_modules/.bin/jetbrains-pi-acp --help
 ./node_modules/.bin/jetbrains-pi-acp --setup
 ```
@@ -39,8 +39,8 @@ npm install /绝对路径/jetbrains-pi-acp/jetbrains-pi-acp-0.1.0.tgz
 ```bash
 npm login
 npm publish --access public
-npm view jetbrains-pi-acp@0.1.0 version
-npx --yes jetbrains-pi-acp@0.1.0 --setup
+npm view jetbrains-pi-acp@0.1.1 version
+npx --yes jetbrains-pi-acp@0.1.1 --setup
 ```
 
 `prepublishOnly` 会运行 `npm test`。npm 如要求双重认证，按其提示完成。发布前应将源码、许可证和文档同步到公开 GitHub 仓库，使清单中的链接可访问。Git 提交、推送和 npm 发布均由维护者单独执行。

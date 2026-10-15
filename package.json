@@ -1,6 +1,6 @@
 {
   "name": "jetbrains-pi-acp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "连接 JetBrains IDE 与 pi coding agent 的 ACP 适配器",
   "bin": {
@@ -24,6 +24,7 @@
     "url": "https://github.com/fun90/jetbrains-pi-acp/issues"
   },
   "files": [
+    "README.zh-CN.md",
     "src/",
     "extensions/",
     "scripts/",

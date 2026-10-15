@@ -424,6 +424,25 @@ for (const option of ['allow-once', 'reject-once', 'cancel']) {
   });
 }
 
+test('完全访问放行 remote-pi 无 ACP 轮次的工具调用，保留其他模式与取消限制', async () => {
+  for (const mode of ['full', 'standard', 'read-only', 'plan']) {
+    for (const turn of [null, { cancelled: true }]) {
+      const records = [];
+      const responses = [];
+      const agent = new Agent({ send: record => records.push(record) });
+      const session = { id: 'remote', mode, turn, pi: { send: response => responses.push(response) } };
+      await agent.ui(session, { id: 'ui-remote', method: 'confirm', title: 'PI_ACP_PERMISSION',
+        message: JSON.stringify({ toolCallId: 'remote-bash', toolName: 'bash', args: { command: 'pwd' } }) });
+      const approved = mode === 'full' && turn === null;
+      assert.deepEqual(responses, [{ type: 'extension_ui_response', id: 'ui-remote',
+        ...(approved ? { confirmed: true } : !turn && ['read-only', 'plan'].includes(mode)
+          ? { confirmed: false } : { cancelled: true }) }]);
+      assert.equal(records.some(record => record.method === 'session/request_permission'), false);
+      assert.equal(session.authorizedTasks?.has('remote-bash') ?? false, approved);
+    }
+  }
+});
+
 test('默认完全访问自动放行，标准访问允许本会话全部工具且不影响其他会话', async t => {
   const c = await client(t);
   const sid = await session(c);
