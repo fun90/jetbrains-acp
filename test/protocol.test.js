@@ -16,6 +16,51 @@ const prompt = { jsonrpc: '2.0', id: 2, method: 'session/prompt',
   params: { sessionId: 's', prompt: [{ type: 'text', text: '你好' }] } };
 const update = value => ({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's', update: value } });
 
+for (const version of [1, 2]) {
+  test(`v${version} 返回每轮 token 并在完成前发布会话累计费用，取消后不串轮`, async () => {
+    const records = [];
+    const protocol = new ProtocolAgent({ send: record => records.push(record) });
+    await protocol.receive({ jsonrpc: '2.0', id: 1, method: 'initialize', params: version === 1
+      ? { protocolVersion: 1 } : { protocolVersion: 2, info: { name: 'test', version: '1' } } });
+    let cost = 0.5;
+    let cancelled = false;
+    const session = { id: 's', blocks: new Map(), pi: { request: async type => {
+      if (type === 'get_session_stats') {
+        await Promise.resolve();
+        return { cost, contextUsage: { tokens: 20, contextWindow: 1000 } };
+      }
+      assert.equal(type, 'prompt');
+      protocol.agent.onUserMessage(session, `user-${cost}`);
+      protocol.agent.event(session, { type: 'agent_start' });
+      for (let index = 0; index < 2; index++) {
+        protocol.agent.event(session, { type: 'message_end', message: {
+          role: 'assistant', content: [], usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 1 },
+        } });
+      }
+      cost += 0.25;
+      protocol.agent.event(session, { type: 'agent_settled', aborted: cancelled });
+      return { disposition: 'started' };
+    } } };
+    protocol.agent.sessions.set('s', session);
+    await protocol.agent.refreshUsage(session);
+    assert.deepEqual(records.at(-1).params.update.cost, { amount: 0.5, currency: 'USD' });
+    for (const id of [2, 3]) {
+      cancelled = id === 3;
+      records.length = 0;
+      await protocol.receive({ ...prompt, id });
+      if (version === 2) await protocol.tails.get('s');
+      const result = version === 1 ? records.at(-1).result : records.at(-1).params.update;
+      assert.equal(result.stopReason, cancelled ? 'cancelled' : 'end_turn');
+      assert.deepEqual(result.usage, { totalTokens: 32, inputTokens: 20, outputTokens: 4,
+        cachedReadTokens: 6, cachedWriteTokens: 2 });
+      const usageIndex = records.findIndex(record => record.params?.update?.sessionUpdate === 'usage_update');
+      assert.ok(usageIndex >= 0 && usageIndex < records.length - 1);
+      assert.deepEqual(records[usageIndex].params.update, { sessionUpdate: 'usage_update', used: 20, size: 1000,
+        cost: { amount: cancelled ? 1 : 0.75, currency: 'USD' } });
+    }
+  });
+}
+
 test('v2 初始化校验、版本协商和失败重试', async () => {
   const records = [];
   const protocol = new ProtocolAgent({ send: record => records.push(record) });
