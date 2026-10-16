@@ -3,7 +3,7 @@
     "pi": {
       "command": "/绝对路径/node",
       "args": [
-        "/绝对路径/jetbrains-acp/src/index.js",
+        "/绝对路径/jetbrains-pi-acp/src/index.js",
         "--pi-command",
         "/绝对路径/pi"
       ],
