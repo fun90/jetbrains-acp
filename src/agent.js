@@ -1224,7 +1224,7 @@ export class Agent {
       modes: { currentModeId: session.mode, availableModes: this.modes }, models: {
         currentModelId: session.currentModelId,
         availableModels: session.availableModels.map(model => ({
-          modelId: `${model.provider}/${model.id}`, name: `${model.name || model.id} (${model.provider})`,
+          modelId: `${model.provider}/${model.id}`, name: model.name || model.id,
         })),
       } };
   }
@@ -1281,7 +1281,7 @@ export class Agent {
         version: 1, recommendedValue: session.recommendedModelId,
       } } } } : {}),
       options: session.availableModels.map(model => ({
-        value: `${model.provider}/${model.id}`, name: `${model.name || model.id} (${model.provider})`,
+        value: `${model.provider}/${model.id}`, name: model.name || model.id,
       })),
     }, { id: 'thinking', name: this.chinese ? '推理级别' : 'Thinking Level', category: 'thought_level', type: 'select',
       currentValue: session.thinkingLevel,
