@@ -88,6 +88,44 @@ async function session(c, mcpServers = [], clientCapabilities, cwd = root) {
   return created.result.sessionId;
 }
 
+test('配置名称和模式说明按系统语言切换，权限标识保持一致', () => {
+  const saved = Object.fromEntries(['LC_ALL', 'LC_MESSAGES', 'LANG'].map(key => [key, process.env[key]]));
+  const session = { id: 'locale', mode: 'full', currentModelId: 'test/model', availableModels: [],
+    thinkingLevel: 'high', thinkingLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] };
+  try {
+    for (const [env, chinese] of [
+      [{ LANG: 'zh_CN.UTF-8' }, true],
+      [{ LANG: 'zh-TW' }, true],
+      [{ LANG: 'en_US.UTF-8' }, false],
+      [{ LANG: 'fr_FR.UTF-8' }, false],
+      [{ LANG: 'zh_CN.UTF-8', LC_MESSAGES: 'en_US.UTF-8' }, false],
+      [{ LANG: 'en_US.UTF-8', LC_MESSAGES: 'en_US.UTF-8', LC_ALL: 'ZH_CN.UTF-8' }, true],
+      [{ LANG: 'zh_CN.UTF-8', LC_ALL: 'C' }, false],
+      [{ LC_ALL: '', LC_MESSAGES: '', LANG: '' }, /^zh(?:[-_.@]|$)/i.test(Intl.DateTimeFormat().resolvedOptions().locale)],
+    ]) {
+      for (const key of Object.keys(saved)) delete process.env[key];
+      Object.assign(process.env, env);
+      const agent = new Agent({ send() {} });
+      const state = agent.sessionState(session);
+      assert.deepEqual(state.modes.availableModes.map(mode => mode.id), ['plan', 'read-only', 'standard', 'full']);
+      assert.deepEqual(state.modes.availableModes.map(mode => mode.name), chinese
+        ? ['规划', '只读', '标准访问', '完全访问'] : ['Plan', 'Read Only', 'Standard Access', 'Full Access']);
+      for (const mode of state.modes.availableModes) assert.equal(/[\u4e00-\u9fff]/u.test(mode.description), chinese);
+      assert.deepEqual(state.configOptions.map(option => option.name), chinese
+        ? ['模型', '推理级别', '权限模式'] : ['Model', 'Thinking Level', 'Permission Mode']);
+      assert.deepEqual(state.configOptions[2].options, state.modes.availableModes.map(({ id, ...mode }) => ({ value: id, ...mode })));
+      assert.deepEqual(state.configOptions[1].options.map(option => option.name), chinese
+        ? ['关闭', '最低', '低', '中', '高', '极高', '最高'] : ['Off', 'Minimal', 'Low', 'Medium', 'High', 'Extra High', 'Max']);
+      assert.equal(state.configOptions[2].currentValue, 'full');
+    }
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test('终端输入校验会话、权限、取消状态及能力协商', async () => {
   const records = [];
   const requests = [];

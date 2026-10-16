@@ -15,12 +15,20 @@ import { changedFiles, fileSnapshot } from './file-changes.js';
 const executeFile = promisify(execFile);
 const extensionPath = fileURLToPath(new URL('../extensions/acp.ts', import.meta.url));
 const invalid = message => Object.assign(new Error(message), { code: -32602 });
-const modes = [
-  { id: 'plan', name: '规划', description: '只分析和制定计划，自动拒绝修改文件及执行命令' },
-  { id: 'read-only', name: '只读', description: '自动拒绝写文件、执行命令及其他非内置只读工具' },
-  { id: 'standard', name: '标准访问', description: '写文件、执行命令及其他非内置只读工具逐次请求授权' },
-  { id: 'full', name: '完全访问', description: '本会话自动允许全部工具调用，包括写文件和执行命令' },
-];
+const modes = {
+  zh: [
+    { id: 'plan', name: '规划', description: '只分析和制定计划，自动拒绝修改文件及执行命令' },
+    { id: 'read-only', name: '只读', description: '自动拒绝写文件、执行命令及其他非内置只读工具' },
+    { id: 'standard', name: '标准访问', description: '写文件、执行命令及其他非内置只读工具逐次请求授权' },
+    { id: 'full', name: '完全访问', description: '本会话自动允许全部工具调用，包括写文件和执行命令' },
+  ],
+  en: [
+    { id: 'plan', name: 'Plan', description: 'Analyze and plan only; automatically deny file changes and command execution' },
+    { id: 'read-only', name: 'Read Only', description: 'Automatically deny file writes, command execution, and tools other than built-in read-only tools' },
+    { id: 'standard', name: 'Standard Access', description: 'Request approval for each file write, command execution, or tool other than built-in read-only tools' },
+    { id: 'full', name: 'Full Access', description: 'Automatically allow all tool calls in this session, including file writes and command execution' },
+  ],
+};
 const toolKind = name => ({ read: 'read', grep: 'search', find: 'search', ls: 'read',
   write: 'edit', edit: 'edit', update_plan: 'think', background_shell: 'execute', bash: 'execute', powershell: 'execute' })[name] || 'other';
 
@@ -93,6 +101,10 @@ export function convertPrompt(blocks) {
 
 export class Agent {
   constructor({ send, command = 'pi', args = [] }) {
+    const locale = process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG ||
+      Intl.DateTimeFormat().resolvedOptions().locale;
+    this.chinese = /^zh(?:[-_.@]|$)/i.test(locale);
+    this.modes = modes[this.chinese ? 'zh' : 'en'];
     this.send = send;
     this.command = command;
     this.args = args;
@@ -258,7 +270,7 @@ export class Agent {
     }
     if (method === 'session/set_mode' || (method === 'session/set_config_option' && params.configId === 'mode')) {
       const modeId = method === 'session/set_mode' ? params.modeId : params.value;
-      if (!modes.some(mode => mode.id === modeId)) throw invalid('未知权限模式');
+      if (!this.modes.some(mode => mode.id === modeId)) throw invalid('未知权限模式');
       await this.setMode(session, modeId);
       return method === 'session/set_mode' ? {} : { configOptions: this.modelConfig(session) };
     }
@@ -1209,7 +1221,7 @@ export class Agent {
 
   sessionState(session) {
     return { sessionId: session.id, configOptions: this.modelConfig(session),
-      modes: { currentModeId: session.mode, availableModes: modes }, models: {
+      modes: { currentModeId: session.mode, availableModes: this.modes }, models: {
         currentModelId: session.currentModelId,
         availableModels: session.availableModels.map(model => ({
           modelId: `${model.provider}/${model.id}`, name: `${model.name || model.id} (${model.provider})`,
@@ -1263,7 +1275,7 @@ export class Agent {
   }
 
   modelConfig(session) {
-    return [{ id: 'model', name: '模型', category: 'model', type: 'select',
+    return [{ id: 'model', name: this.chinese ? '模型' : 'Model', category: 'model', type: 'select',
       currentValue: session.currentModelId,
       ...(this.airRecommendedValue ? { _meta: { jetbrains: { air: {
         version: 1, recommendedValue: session.recommendedModelId,
@@ -1271,17 +1283,19 @@ export class Agent {
       options: session.availableModels.map(model => ({
         value: `${model.provider}/${model.id}`, name: `${model.name || model.id} (${model.provider})`,
       })),
-    }, { id: 'thinking', name: '推理级别', category: 'thought_level', type: 'select',
+    }, { id: 'thinking', name: this.chinese ? '推理级别' : 'Thinking Level', category: 'thought_level', type: 'select',
       currentValue: session.thinkingLevel,
       ...(this.airRecommendedValue && session.thinkingLevels.includes(session.recommendedThinkingLevel) ? { _meta: { jetbrains: { air: {
         version: 1, recommendedValue: session.recommendedThinkingLevel,
       } } } } : {}),
       options: session.thinkingLevels.map(level => ({ value: level,
-        name: ({ off: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高' })[level] || level,
+        name: (this.chinese
+          ? { off: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高' }
+          : { off: 'Off', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max' })[level] || level,
       })),
-    }, { id: 'mode', name: '权限模式', category: 'mode', type: 'select',
+    }, { id: 'mode', name: this.chinese ? '权限模式' : 'Permission Mode', category: 'mode', type: 'select',
       currentValue: session.mode,
-      options: modes.map(mode => ({ value: mode.id, name: mode.name, description: mode.description })),
+      options: this.modes.map(mode => ({ value: mode.id, name: mode.name, description: mode.description })),
     }];
   }
 
