@@ -198,7 +198,7 @@ export class ProtocolAgent {
     if (record.method === 'session/resume') {
       const session = this.agent.sessions.get(request.params.sessionId);
       if (this.agent.lifecycleOperations.has(request.params.sessionId) || this.replays.has(request.params.sessionId) ||
-          session?.turn || session?.command || session?.changingConfig) {
+          (session && this.agent.busy(session))) {
         return this.error(record.id, invalid('会话正在使用，请稍后重试'));
       }
       if (request.params.replayFrom != null) {
