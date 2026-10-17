@@ -1,7 +1,6 @@
 import packageInfo from '../package.json' with { type: 'json' };
-import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { isDeepStrictEqual, promisify } from 'node:util';
+import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { mkdtemp, writeFile, rm, stat, unlink, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -9,12 +8,16 @@ import { fileURLToPath } from 'node:url';
 import { validateTerminalInput } from './terminal-input.js';
 import { PiProcess } from './pi.js';
 import { Tasks } from './tasks.js';
-import { gitPatch, fileDiffs, toolPath } from './file-diff.js';
+import { Interactions } from './interactions.js';
+import { Transcript } from './transcript.js';
+import { SessionIndex } from './session-index.js';
+import { SessionFork } from './session-fork.js';
+import { Commands } from './commands.js';
+import { convertMcp, convertPrompt } from './convert.js';
 import { changedFiles, fileSnapshot } from './file-changes.js';
+import { air, invalid, logError, modelKey, requireCwd, requireId, restrictedModes } from './shared.js';
 
-const executeFile = promisify(execFile);
 const extensionPath = fileURLToPath(new URL('../extensions/acp.ts', import.meta.url));
-const invalid = message => Object.assign(new Error(message), { code: -32602 });
 const modes = {
   zh: [
     { id: 'plan', name: '规划', description: '只分析和制定计划，自动拒绝修改文件及执行命令' },
@@ -29,111 +32,27 @@ const modes = {
     { id: 'full', name: 'Full Access', description: 'Automatically allow all tool calls in this session, including file writes and command execution' },
   ],
 };
-const toolKind = name => ({ read: 'read', grep: 'search', find: 'search', ls: 'read',
-  write: 'edit', edit: 'edit', update_plan: 'think', background_shell: 'execute', bash: 'execute', powershell: 'execute' })[name] || 'other';
-const readOnlyTools = ['read', 'grep', 'find', 'ls', 'update_plan', 'task_status'];
-const terminalTools = ['bash', 'powershell'];
-const lifecycleMethods = { 'session/load': 'loadSession', 'session/resume': 'resumeSession',
-  'session/close': 'closeSession', 'session/delete': 'deleteSession', 'session/fork': 'forkSession',
-  '_session/rename': 'renameSession', '_session/goal': 'goalSession' };
-const modelKey = model => `${model.provider}/${model.id}`;
-const air = value => ({ _meta: { jetbrains: { air: { version: 1, ...value } } } });
-const logError = label => error => process.stderr.write(`${label}：${error.message}\n`);
-const requireId = sessionId => {
-  if (typeof sessionId !== 'string' || !sessionId) throw invalid('缺少 sessionId');
-};
-const requireCwd = (cwd, message = 'cwd 必须是绝对路径') => {
-  if (typeof cwd !== 'string' || !isAbsolute(cwd)) throw invalid(message);
+
+// 需要按会话串行执行的方法（见 Agent.lifecycle）。
+const lifecycleMethods = {
+  'session/load': (agent, params) => agent.loadSession(params),
+  'session/resume': (agent, params) => agent.resumeSession(params),
+  'session/close': (agent, params) => agent.closeSession(params),
+  'session/delete': (agent, params) => agent.deleteSession(params),
+  'session/fork': (agent, params) => agent.forks.fork(params),
+  '_session/rename': (agent, params) => agent.renameSession(params),
+  '_session/goal': (agent, params) => agent.goalSession(params),
 };
 
-function suffixPrefixOverlap(previous, next) {
-  const values = [
-    ...Array.from(next, character => character.codePointAt(0)),
-    -1,
-    ...Array.from(previous, character => character.codePointAt(0)).slice(-[...next].length),
-  ];
-  const prefix = new Array(values.length).fill(0);
-  for (let index = 1; index < values.length; index++) {
-    let matched = prefix[index - 1];
-    while (matched && values[index] !== values[matched]) matched = prefix[matched - 1];
-    if (values[index] === values[matched]) matched++;
-    prefix[index] = matched;
-  }
-  return Math.min(prefix.at(-1), next.length);
-}
-
-export function convertMcp(servers) {
-  if (!Array.isArray(servers)) throw invalid('mcpServers 必须是数组');
-  const result = Object.create(null);
-  const names = new Set();
-  for (const server of servers) {
-    if (!server || typeof server.name !== 'string' || !/^[\w-]+$/.test(server.name)) {
-      throw invalid('MCP 名称只允许字母、数字、下划线和连字符');
-    }
-    const key = server.name.replaceAll('-', '_');
-    if (names.has(key)) throw invalid('MCP 名称重复');
-    names.add(key);
-    if (server.type === 'http') {
-      if (typeof server.url !== 'string' || !/^https?:\/\//.test(server.url) ||
-          !Array.isArray(server.headers) || server.headers.some(h =>
-            !h || typeof h.name !== 'string' || typeof h.value !== 'string')) {
-        throw invalid('HTTP MCP 配置无效');
-      }
-      result[server.name] = { url: server.url,
-        headers: Object.fromEntries(server.headers.map(h => [h.name, h.value])), exposure: 'direct' };
-    } else if (!server.type || server.type === 'stdio') {
-      if (typeof server.command !== 'string' || !isAbsolute(server.command) ||
-          !Array.isArray(server.args) || server.args.some(a => typeof a !== 'string') ||
-          !Array.isArray(server.env) || server.env.some(e =>
-            !e || typeof e.name !== 'string' || typeof e.value !== 'string')) {
-        throw invalid('stdio MCP 需要绝对命令路径、args 和 env 数组');
-      }
-      result[server.name] = { command: server.command, args: server.args,
-        env: Object.fromEntries(server.env.map(e => [e.name, e.value])), exposure: 'direct' };
-    } else throw invalid(`不支持 MCP 传输：${server.type}`);
-  }
-  return result;
-}
-
-export function convertPrompt(blocks) {
-  if (!Array.isArray(blocks) || !blocks.length) throw invalid('prompt 必须包含内容');
-  const text = [];
-  const images = [];
-  for (const block of blocks) {
-    if (block?.type === 'text' && typeof block.text === 'string') text.push(block.text);
-    else if (block?.type === 'image' && typeof block.data === 'string' &&
-             typeof block.mimeType === 'string' && block.mimeType.startsWith('image/')) {
-      images.push({ type: 'image', data: block.data, mimeType: block.mimeType });
-    } else if (block?.type === 'resource' && typeof block.resource?.text === 'string') {
-      text.push(`文件上下文（${block.resource.uri}）：\n${block.resource.text}`);
-    } else if (block?.type === 'resource_link' && typeof block.uri === 'string') {
-      text.push(`引用资源：${block.uri}`);
-    } else throw invalid(`不支持的提示内容：${block?.type}`);
-  }
-  return { message: text.join('\n\n'), ...(images.length ? { images } : {}) };
-}
-
-// 扩展通过 notify 传回的控制消息，以 Agent 实例为 this 调用。
-const notifyHandlers = {
-  'PI_ACP_TERMINAL_READY:'(session, id) {
-    session.inputTerminals.add(id);
-    this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: id,
-      _meta: { terminal_info: { terminal_id: id, cwd: session.cwd, input_enabled: true } } });
-  },
-  'PI_ACP_SESSIONS:'(session, payload) {
-    session.history = JSON.parse(payload);
-  },
-  'PI_ACP_MESSAGE:'(session, payload) {
-    const message = JSON.parse(payload);
-    if (message.role === 'assistant') session.assistantMessageId = message.id;
-    if (message.role === 'user') this.onUserMessage?.(session, message.id);
-  },
-  'PI_ACP_GOAL:'(session, payload) {
-    session.goal = JSON.parse(payload);
-    if (session.availableModels && !session.changingConfig) this.goalUpdate(session);
-  },
-};
-
+// ACP v1 协议入口：分发 JSON-RPC 请求、管理会话生命周期与提示轮次，并把 pi 事件转成 ACP 更新。
+// 每个会话对应一个 pi RPC 子进程（session.pi）。按职责拆出的协作者：
+//   tasks        子 agent 与后台 shell 任务（tasks.js）
+//   interactions 扩展 UI 请求、工具授权、表单与 URL 交互（interactions.js）
+//   transcript   工具调用、计划、压缩及历史回放的渲染（transcript.js）
+//   index        历史会话列表、归档与列表订阅（session-index.js）
+//   forks        会话分叉（session-fork.js）
+//   commands     /status、/compact、/goal 等本地命令（commands.js）
+// ACP v2 由 protocol.js 的 ProtocolAgent 转换后调用本类。
 export class Agent {
   constructor({ send, command = 'pi', args = [] }) {
     const locale = process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG ||
@@ -145,10 +64,12 @@ export class Agent {
     this.args = args;
     this.sessions = new Map();
     this.tasks = new Tasks(this);
-    this.permissions = new Map();
-    this.urlElicitations = new Map();
+    this.interactions = new Interactions(this);
+    this.transcript = new Transcript(this);
+    this.index = new SessionIndex(this);
+    this.forks = new SessionFork(this);
+    this.commands = new Commands(this);
     this.lifecycleOperations = new Map();
-    this.subscriptions = new Map();
     this.sequence = 0;
     this.clientCapabilities = {};
     this.initialized = false;
@@ -184,11 +105,7 @@ export class Agent {
       return;
     }
     if (!message.method && ('result' in message || 'error' in message)) {
-      const permission = this.permissions.get(message.id);
-      if (permission) {
-        this.permissions.delete(message.id);
-        permission.resolve(message.result);
-      }
+      this.interactions.resolve(message.id, message.result);
       return;
     }
     if (typeof message.method !== 'string') {
@@ -270,24 +187,24 @@ export class Agent {
       const session = this.sessions.get(params.sessionId);
       if (!session) throw invalid('会话不存在');
       if (method.endsWith('/stop')) return this.tasks.stop(session, params.asyncTaskId);
-      return { tasks: [...this.tasks.tasks.values()].filter(task => task.owner === session.id)
+      return { tasks: this.tasks.ownedBy(session.id)
         .map(task => this.tasks.snapshot(task)) };
     }
     if (method === '_terminal/input') return this.terminalInput(params);
     if (method === 'session/new') return this.newSession(params);
     if (method === 'session/list') {
-      const listed = await this.listSessions(params);
-      return { ...listed, sessions: listed.sessions.map(info => this.sessionInfo(info)) };
+      const listed = await this.index.list(params);
+      return { ...listed, sessions: listed.sessions.map(info => this.index.info(info)) };
     }
     if (Object.hasOwn(lifecycleMethods, method)) {
-      return this.lifecycle(params.sessionId, () => this[lifecycleMethods[method]](params));
+      return this.lifecycle(params.sessionId, () => lifecycleMethods[method](this, params));
     }
     if (method === '_session/archive' || method === '_session/unarchive') {
       if (!this.airIndex) throw invalid('客户端未协商 sessionIndex');
-      return this.lifecycle(params.sessionId, () => this.archiveSession(params, method === '_session/archive'));
+      return this.lifecycle(params.sessionId, () => this.index.archive(params, method === '_session/archive'));
     }
-    if (method === '_session/list/subscribe') return this.subscribeList(params);
-    if (method === '_session/list/unsubscribe') return this.unsubscribeList(params);
+    if (method === '_session/list/subscribe') return this.index.subscribe(params);
+    if (method === '_session/list/unsubscribe') return this.index.unsubscribe(params);
     if (!['session/prompt', '_session/steering', 'session/cancel', 'session/set_model', 'session/set_config_option', 'session/set_mode'].includes(method)) {
       throw Object.assign(new Error(`不支持的方法：${method}`), { code: -32601 });
     }
@@ -327,31 +244,22 @@ export class Agent {
       }
     }
     if (method === 'session/cancel') {
-      this.cancelPermissions(session);
+      this.interactions.cancel(session);
       if (session.parentId) await this.tasks.close(session);
       await this.cancelTurn(session);
       return {};
     }
     const steering = method === '_session/steering';
-    if (this.terminalChatInput) {
-      const input = convertPrompt(params.prompt);
-      if (!input.images && (/^\/stdin(?: |$)/.test(input.message) || input.message.trim() === '/eof')) {
-        const terminals = [...session.inputTerminals];
-        if (terminals.length !== 1) throw invalid('需要恰好一个可输入的运行中终端');
-        const eof = input.message.trim() === '/eof';
-        await this.terminalInput({ sessionId: session.id, terminalId: terminals[0],
-          data: eof ? '' : input.message.slice(7) + '\n', eof });
-        return steering ? { outcome: 'injected' } : { stopReason: 'end_turn' };
-      }
+    if (this.terminalChatInput && await this.commands.terminalChat(session, convertPrompt(params.prompt))) {
+      return steering ? { outcome: 'injected' } : { stopReason: 'end_turn' };
     }
     if (session.turn && !steering) throw invalid('该会话已有正在执行的提示');
     if (session.turn?.cancelled) throw invalid('会话正在取消，请稍后重试');
     if (session.turn?.finishing) throw invalid('会话正在生成文件报告，请稍后重试');
     if (session.changingConfig) throw invalid('配置正在切换，请稍后重试');
     const prompt = convertPrompt(params.prompt);
-    if (!steering && !prompt.images && (prompt.message.trim() === '/status' ||
-        /^\/(compact|goal)(?:\s|$)/.test(prompt.message.trim()))) {
-      return this.localCommand(session, prompt.message.trim(), this.fileReportRequest(params));
+    if (!steering && !prompt.images && this.commands.isLocal(prompt.message.trim())) {
+      return this.commands.run(session, prompt.message.trim(), this.fileReportRequest(params));
     }
     return this.prompt(session, prompt, steering, steering ? undefined : this.fileReportRequest(params));
   }
@@ -361,7 +269,7 @@ export class Agent {
     try { validateTerminalInput(params); } catch (error) { throw invalid(error.message); }
     const session = this.requireSession(params.sessionId);
     if (!session.turn || session.turn.cancelled || session.changingConfig ||
-        this.lifecycleOperations.has(session.id) || ['read-only', 'plan'].includes(session.mode) ||
+        this.lifecycleOperations.has(session.id) || restrictedModes.includes(session.mode) ||
         !session.inputTerminals?.has(params.terminalId)) throw invalid('终端当前不可输入');
     await session.pi.request('terminal_input', { terminalId: params.terminalId, data: params.data, eof: params.eof });
     if (params.eof) session.inputTerminals.delete(params.terminalId);
@@ -454,7 +362,7 @@ export class Agent {
       turn.finish = () => {
         if (session.turn !== turn || !turn.settled || turn.pending || turn.finishing) return;
         const complete = () => {
-          this.cancelPermissions(session, { keepAcceptedUrls: true });
+          this.interactions.cancel(session, { keepAcceptedUrls: true });
           session.turn = null;
           if (steering && turn.error && !turn.cancelled) {
             this.update(session, { sessionUpdate: 'agent_message_chunk',
@@ -554,11 +462,6 @@ export class Agent {
     return { stopReason: 'end_turn', ...usage, ...air({ sessionFailure: this.sessionFailure(session, error) }) };
   }
 
-  async findSaved(sessionId, cwd) {
-    const { sessions } = await this.listSessions(cwd === undefined ? {} : { cwd }, { includeArchived: true });
-    return sessions.find(info => info.sessionId === sessionId && (cwd === undefined || resolve(info.cwd) === resolve(cwd)));
-  }
-
   // 打开当前目录中的历史会话；已打开时校验可复用并按需更新 MCP 配置。
   async openSession(params, metadata) {
     requireId(params.sessionId);
@@ -571,7 +474,7 @@ export class Agent {
       if (existing.failure) throw existing.failure;
       return this.updateSessionMcp(existing, params);
     }
-    const saved = await this.findSaved(params.sessionId, params.cwd);
+    const saved = await this.index.find(params.sessionId, params.cwd);
     if (this.sessions.has(params.sessionId)) throw invalid('会话正在加载，请稍后重试');
     if (!saved) throw invalid('当前目录中没有此历史会话');
     await this.newSession(params, { ...metadata, id: saved.sessionId, path: saved.path });
@@ -612,7 +515,7 @@ export class Agent {
 
   async updateSessionMcp(existing, params) {
     if (isDeepStrictEqual(convertMcp(params.mcpServers ?? []), convertMcp(existing.mcpServers))) return existing;
-    if ([...this.tasks.tasks.values()].some(task => task.owner === existing.id && task.state === 'running')) {
+    if (this.tasks.ownedBy(existing.id).some(task => task.state === 'running')) {
       throw invalid('后台任务正在运行，请结束任务后再更新 MCP 配置');
     }
     existing.changingConfig = true;
@@ -646,7 +549,7 @@ export class Agent {
     const live = this.sessions.get(params.sessionId);
     const requestedCwd = params.cwd ?? live?.cwd;
     if (requestedCwd !== undefined) requireCwd(requestedCwd);
-    const saved = await this.findSaved(params.sessionId, requestedCwd);
+    const saved = await this.index.find(params.sessionId, requestedCwd);
     if (!saved) throw invalid('没有此历史会话');
     const cwd = requestedCwd ?? saved.cwd;
     let header;
@@ -680,7 +583,7 @@ export class Agent {
       await session.pi.request('set_session_name', { name: params.title.trim() });
       return {};
     }
-    const saved = await this.findSaved(params.sessionId);
+    const saved = await this.index.find(params.sessionId);
     if (!saved) throw invalid('没有此历史会话');
     const opened = await this.newSession({ cwd: saved.cwd, mcpServers: [] }, { id: saved.sessionId, path: saved.path });
     try { await this.sessions.get(opened.sessionId).pi.request('set_session_name', { name: params.title.trim() }); }
@@ -693,7 +596,7 @@ export class Agent {
     const session = this.sessions.get(params.sessionId);
     if (!session) return {};
     session.changingConfig = true;
-    this.cancelPermissions(session);
+    this.interactions.cancel(session);
     try {
       await this.tasks.close(session);
       await this.cancelTurn(session, true);
@@ -720,204 +623,6 @@ export class Agent {
     if (wait) await turn.completed;
   }
 
-  async forkSession(params) {
-    requireId(params.sessionId);
-    const fork = params._meta?.jetbrains?.air?.fork;
-    if (fork !== undefined && (!fork || Array.isArray(fork) || fork.version !== 1 ||
-        typeof fork.messageId !== 'string' || !fork.messageId.trim() ||
-        (fork.messageFingerprint !== undefined && (typeof fork.messageFingerprint !== 'string' ||
-          !/^sha256:[a-fA-F0-9]{64}$/.test(fork.messageFingerprint))) ||
-        (fork.messageOccurrence !== undefined && (!Number.isSafeInteger(fork.messageOccurrence) || fork.messageOccurrence < 1)))) {
-      throw invalid('分叉点参数无效');
-    }
-    let source = this.sessions.get(params.sessionId);
-    if (!source) {
-      requireCwd(params.cwd, '分叉历史会话需要绝对 cwd');
-      const saved = await this.findSaved(params.sessionId, params.cwd);
-      if (!saved) throw invalid('当前目录中没有此历史会话');
-      await this.newSession({ cwd: params.cwd, mcpServers: params.mcpServers ?? [] },
-        { id: saved.sessionId, path: saved.path });
-      source = this.sessions.get(params.sessionId);
-    }
-    if (this.busy(source)) throw invalid('会话正在使用，请稍后重试');
-    const cwd = params.cwd ?? source.cwd;
-    if (typeof cwd !== 'string' || !isAbsolute(cwd) || resolve(cwd) !== resolve(source.cwd)) {
-      throw invalid('分叉会话必须使用原工作目录');
-    }
-    const requestedMcp = params.mcpServers ?? source.mcpServers;
-    convertMcp(requestedMcp);
-    source.changingConfig = true;
-    try {
-      return await this.cloneSession(source, params, cwd);
-    } finally {
-      source.changingConfig = false;
-    }
-  }
-
-  async cloneSession(source, params, cwd) {
-    const fork = params._meta?.jetbrains?.air?.fork;
-    let forkEntryId;
-    if (fork) {
-      const branch = this.tasks.branch(await source.pi.request('get_entries'));
-      const messageId = fork.messageId.replace(/:segment:\d+$/, '');
-      let index = branch.findIndex(entry => entry.message?.role === 'assistant' &&
-        (entry.message.acpMessageId ?? entry.id) === messageId);
-      if (index < 0 && fork.messageFingerprint) {
-        let occurrence = 0;
-        index = branch.findIndex(entry => {
-          if (entry.message?.role !== 'assistant') return false;
-          const text = (entry.message.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('');
-          const fingerprint = `sha256:${createHash('sha256').update(text).digest('hex')}`;
-          return fingerprint === fork.messageFingerprint.toLowerCase() && ++occurrence === (fork.messageOccurrence ?? 1);
-        });
-      }
-      if (index < 0) throw invalid('当前分支中没有此助手消息');
-      // 保留消息所在整轮，避免在工具调用与结果之间截断历史。
-      const nextUser = branch.findIndex((entry, position) => position > index && entry.message?.role === 'user');
-      forkEntryId = branch[nextUser < 0 ? branch.length - 1 : nextUser - 1].id;
-    }
-    const oldState = await source.pi.request('get_state');
-    const sourceMode = source.mode;
-    const sourceModelId = source.currentModelId;
-    const sourceThinking = source.thinkingLevel;
-    const sourceMcp = source.mcpServers;
-    const customInstructions = source.customInstructions ? { _meta: { jetbrains: { air: {
-      customInstructions: source.customInstructions,
-    } } } } : {};
-    if (!oldState.sessionFile) throw new Error('原会话未持久保存');
-    const cloned = forkEntryId
-      ? await source.pi.request('prompt', { message: `/__acp_fork ${JSON.stringify(forkEntryId)}` })
-      : await source.pi.request('clone');
-    if (cloned?.cancelled) throw invalid('pi 取消了会话分叉');
-    let newState;
-    try {
-      newState = await source.pi.request('get_state');
-      if (forkEntryId && newState.sessionId === source.id) throw invalid('pi 未执行指定消息分叉');
-      if (!newState.sessionId || newState.sessionId === source.id || !newState.sessionFile) {
-        throw new Error('pi 未创建正确的分叉会话');
-      }
-      await source.pi.request('prompt', { message: '/__acp_check' });
-      await source.pi.request('prompt', { message: `/__acp_mode ${sourceMode === 'plan' ? 'plan' : 'default'}` });
-    } catch (error) {
-      if (forkEntryId && newState?.sessionId === source.id) throw error;
-      await this.disposeSession(source);
-      throw error;
-    }
-    this.sessions.delete(source.id);
-    source.id = newState.sessionId;
-    this.sessions.set(source.id, source);
-    try {
-      const requestedMcp = params.mcpServers ?? sourceMcp;
-      const changeMcp = !isDeepStrictEqual(convertMcp(requestedMcp), convertMcp(sourceMcp));
-      if (changeMcp) {
-        await this.disposeSession(source);
-        await this.newSession({ cwd, mcpServers: requestedMcp, ...customInstructions },
-          { id: newState.sessionId, path: newState.sessionFile });
-        source = this.sessions.get(newState.sessionId);
-      }
-      await this.newSession({ cwd, mcpServers: sourceMcp, ...customInstructions },
-        { id: params.sessionId, path: oldState.sessionFile });
-      const restored = this.sessions.get(params.sessionId);
-      for (const session of changeMcp ? [restored, source] : [restored]) {
-        await this.applyModelConfig(session, sourceModelId, sourceThinking, false);
-        await this.setMode(session, sourceMode, false);
-      }
-    } catch (error) {
-      const restored = this.sessions.get(params.sessionId);
-      if (restored) await this.disposeSession(restored);
-      this.sessions.delete(source.id);
-      await this.disposeSession(source);
-      throw error;
-    }
-    await Promise.all([
-      this.publishCommands(source).catch(logError('发布命令失败')),
-      this.refreshUsage(source).catch(logError('刷新用量失败')),
-    ]);
-    if (source.goal) this.goalUpdate(source);
-    return this.sessionState(source);
-  }
-
-  async localCommand(session, text, fileReportRequest) {
-    const finish = result => {
-      if (fileReportRequest) this.sendFileReport(session, { fileReportRequest, changedPaths: new Set(), starts: 0,
-        cancelled: session.command?.cancelled, error: session.command?.error });
-      return result;
-    };
-    if (/^\/goal(?:\s|$)/.test(text)) {
-      const argument = text.slice('/goal'.length).trim();
-      if (!argument) {
-        this.update(session, { sessionUpdate: 'agent_message_chunk', content: { type: 'text',
-          text: session.goal ? `长期目标（${session.goal.status}）：${session.goal.objective}` : '尚未设置长期目标' } });
-      } else {
-        await this.lifecycle(session.id, () => this.goalSession({ sessionId: session.id,
-          ...(['pause', 'resume', 'clear'].includes(argument)
-            ? { action: argument } : { action: 'set', objective: argument }),
-        }));
-      }
-      return finish({ stopReason: 'end_turn' });
-    }
-    if (text === '/status') {
-      const stats = await session.pi.request('get_session_stats');
-      const usage = stats.contextUsage;
-      const lines = [
-        `模型：${session.currentModelId}`,
-        `推理级别：${session.thinkingLevel}`,
-        `消息：${stats.totalMessages}，工具调用：${stats.toolCalls}`,
-        `累计 token：${stats.tokens?.total ?? 0}，成本：$${Number(stats.cost ?? 0).toFixed(4)}`,
-        usage ? `上下文：${usage.tokens ?? '待刷新'} / ${usage.contextWindow}${usage.percent == null ? '' : ` (${usage.percent}%)`}` : '上下文：不可用',
-      ];
-      this.update(session, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: lines.join('\n') } });
-      await this.sendUsage(session, stats);
-      return finish({ stopReason: 'end_turn' });
-    }
-    const customInstructions = text.slice('/compact'.length).trim() || undefined;
-    const command = { cancelled: false };
-    session.command = command;
-    session.changingConfig = true;
-    try {
-      const result = await session.pi.request('compact', customInstructions ? { customInstructions } : {});
-      if (command.cancelled) return finish({ stopReason: 'cancelled' });
-      if (this.clientCapabilities?.session?.compaction == null) {
-        this.update(session, { sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: `上下文压缩完成：${result?.tokensBefore ?? '?'} → ${result?.estimatedTokensAfter ?? '?'} tokens` } });
-      }
-      await this.refreshUsage(session).catch(logError('刷新用量失败'));
-      return finish({ stopReason: 'end_turn' });
-    } catch (error) {
-      if (command.cancelled) return finish({ stopReason: 'cancelled' });
-      command.error = error;
-      if (this.airSessionFailure) return finish(this.failureResult(session, error));
-      finish({});
-      throw error;
-    } finally {
-      session.command = null;
-      session.changingConfig = false;
-    }
-  }
-
-  async publishCommands(session) {
-    const result = await session.pi.request('get_commands');
-    const availableCommands = new Map([
-      ['status', { name: 'status', description: '显示当前模型、token、成本和上下文使用情况', input: null }],
-      // Air 的 ACP v1 解析器需要 input 的类型判别字段。
-      ['compact', { name: 'compact', description: '压缩对话上下文，可附带摘要要求', input: { type: 'unstructured', hint: '可选摘要要求' } }],
-      ['goal', { name: 'goal', description: '设置或查看长期目标，也支持 pause、resume、clear',
-        input: { type: 'unstructured', hint: '目标内容或 pause / resume / clear' } }],
-    ]);
-    if (this.terminalChatInput) {
-      availableCommands.set('stdin', { name: 'stdin', description: '向当前运行的终端输入一行文本',
-        input: { type: 'unstructured', hint: '输入文本，自动添加换行' } });
-      availableCommands.set('eof', { name: 'eof', description: '关闭当前运行终端的 stdin', input: null });
-    }
-    for (const command of result?.commands ?? []) {
-      if (!command?.name || command.name.startsWith('__acp') || availableCommands.has(command.name)) continue;
-      availableCommands.set(command.name, { name: command.name,
-        description: command.description || command.name, input: null });
-    }
-    this.update(session, { sessionUpdate: 'available_commands_update',
-      availableCommands: [...availableCommands.values()] });
-  }
-
   async sendUsage(session, stats) {
     const usage = stats?.contextUsage;
     if (usage && Number.isFinite(usage.tokens) && Number.isFinite(usage.contextWindow) && usage.contextWindow > 0) {
@@ -932,133 +637,12 @@ export class Agent {
     await this.sendUsage(session, await session.pi.request('get_session_stats'));
   }
 
-  sessionInfo({ path, archived, forkedFrom, ...info }) {
-    if (!this.airIndex) return info;
-    const active = this.sessions.get(info.sessionId);
-    const requiresAction = [...this.permissions.values()].some(request => request.session === active);
-    return { ...info, ...air({ archived: archived === true,
-      state: active?.failure ? 'error' : requiresAction ? 'requires_action' : active?.turn || active?.command ? 'running' : 'idle',
-      ...(active?.currentModelId ? { model: active.currentModelId } : {}),
-      ...(forkedFrom ? { forkedFrom } : {}),
-    }) };
-  }
-
-  async readHistory(context, params) {
-    let cwds = [context.cwd];
-    if (params._meta?.jetbrains?.air?.list?.includeWorktrees === true) {
-      try {
-        const { stdout } = await executeFile('git', ['worktree', 'list', '--porcelain', '-z'],
-          { cwd: context.cwd, timeout: 5000, maxBuffer: 1024 * 1024 });
-        cwds = [...new Set([...cwds, ...stdout.split('\0').filter(value => value.startsWith('worktree '))
-          .map(value => value.slice('worktree '.length))])];
-      } catch { /* 非 Git 项目只查询当前工作目录。 */ }
-    }
-    context.history = undefined;
-    await context.pi.request('prompt', { message: `/__acp_list ${JSON.stringify({ all: params.cwd === undefined, cwds })}` });
-    if (!context.history) throw new Error('pi 未返回历史会话列表');
-    return context.history;
-  }
-
-  async listSessions(params, { includeArchived = false } = {}) {
-    if (params.cursor !== undefined && (typeof params.cursor !== 'string' || !/^\d+$/.test(params.cursor))) {
-      throw invalid('会话列表游标无效');
-    }
-    const offset = Number(params.cursor ?? 0);
-    if (!Number.isSafeInteger(offset)) throw invalid('会话列表游标无效');
-    const options = params._meta?.jetbrains?.air?.list ?? {};
-    const limit = options.limit ?? Number.POSITIVE_INFINITY;
-    if (options.limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)) {
-      throw invalid('会话列表数量限制无效');
-    }
-    const archived = includeArchived ? 'all' : options.archived ?? 'unarchived';
-    if (!['unarchived', 'archived', 'all'].includes(archived)) throw invalid('归档筛选无效');
-    if (options.includeWorktrees !== undefined && typeof options.includeWorktrees !== 'boolean') {
-      throw invalid('includeWorktrees 必须是布尔值');
-    }
-    const created = await this.newSession({ cwd: params.cwd ?? process.cwd(), mcpServers: [] }, { discovery: true });
-    try {
-      const history = (await this.readHistory(created, params)).filter(info =>
-        archived === 'all' || (info.archived === true) === (archived === 'archived'));
-      const sessions = history.slice(offset, offset + limit);
-      return { sessions, ...(offset + limit < history.length ? { nextCursor: String(offset + limit) } : {}) };
-    } finally {
-      await this.closeSession({ sessionId: created.id });
-    }
-  }
-
-  async archiveSession(params, archived) {
-    requireId(params.sessionId);
-    const live = this.sessions.get(params.sessionId);
-    const saved = await this.findSaved(params.sessionId);
-    if (!saved) throw invalid('没有此历史会话');
-    if (archived && live) await this.closeSession({ sessionId: live.id });
-    const temporary = !this.sessions.has(params.sessionId);
-    if (temporary) await this.newSession({ cwd: saved.cwd, mcpServers: [] }, { id: saved.sessionId, path: saved.path });
-    const context = this.sessions.get(params.sessionId);
-    try {
-      if (archived && !live) {
-        const entries = await context.pi.request('get_entries');
-        await this.tasks.restore(context, this.tasks.branch(entries), { replay: false });
-        await this.tasks.close(context);
-      }
-      await context.pi.request('prompt', { message: `/__acp_archive ${archived}` });
-      this.update(context, { sessionUpdate: 'session_info_update', ...air({ archived }) });
-    } finally {
-      if (temporary) await this.closeSession({ sessionId: context.id });
-    }
-    return {};
-  }
-
-  async subscribeList(params) {
-    if (!this.airIndex) throw invalid('客户端未协商 sessionIndex');
-    requireCwd(params.cwd);
-    if (this.subscriptions.size >= 8) throw invalid('会话列表订阅数量已达上限');
-    const subscription = { id: randomUUID(), cwd: params.cwd, active: true, previous: new Map() };
-    this.subscriptions.set(subscription.id, subscription);
-    try {
-      subscription.context = await this.newSession({ cwd: params.cwd, mcpServers: [] }, { discovery: true });
-      if (this.closing) throw new Error('适配器正在关闭');
-      await this.refreshSubscription(subscription, false);
-      subscription.timer = setInterval(() => {
-        if (!subscription.active || subscription.pending || this.closing) return;
-        subscription.pending = this.refreshSubscription(subscription).catch(error => {
-          if (subscription.active && !this.closing) process.stderr.write(`刷新会话列表失败：${error.message}\n`);
-        }).finally(() => { subscription.pending = null; });
-      }, 2000);
-      subscription.timer.unref();
-      setImmediate(() => {
-        if (subscription.active && !this.closing) this.send({ jsonrpc: '2.0', method: '_session/list/changes',
-          params: { subscriptionId: subscription.id, sessions: [...subscription.previous.values()], removed: [] } });
-      });
-      return { subscriptionId: subscription.id };
-    } catch (error) {
-      await this.unsubscribeList({ subscriptionId: subscription.id });
-      throw error;
-    }
-  }
-
-  async refreshSubscription(subscription, emit = true) {
-    const history = await this.readHistory(subscription.context, { cwd: subscription.cwd,
-      _meta: { jetbrains: { air: { list: { includeWorktrees: true } } } } });
-    if (!subscription.active) return;
-    const current = new Map(history.map(info => [info.sessionId, this.sessionInfo(info)]));
-    const sessions = [...current.values()].filter(info =>
-      JSON.stringify(info) !== JSON.stringify(subscription.previous.get(info.sessionId)));
-    const removed = [...subscription.previous.keys()].filter(id => !current.has(id));
-    subscription.previous = current;
-    if (emit && (sessions.length || removed.length)) this.send({ jsonrpc: '2.0', method: '_session/list/changes',
-      params: { subscriptionId: subscription.id, sessions, removed } });
-  }
-
-  async unsubscribeList(params) {
-    if (typeof params.subscriptionId !== 'string' || !params.subscriptionId) throw invalid('缺少 subscriptionId');
-    const subscription = this.subscriptions.get(params.subscriptionId);
-    if (!subscription) return {};
-    subscription.active = false;
-    clearInterval(subscription.timer);
-    this.subscriptions.delete(subscription.id);
-    if (subscription.context) await this.closeSession({ sessionId: subscription.context.id });
-    return {};
+  // 会话就绪后发布可用命令与用量；失败只记录日志。
+  async publishSession(session) {
+    await Promise.all([
+      this.commands.publish(session).catch(logError('发布命令失败')),
+      this.refreshUsage(session).catch(logError('刷新用量失败')),
+    ]);
   }
 
   async loadSession(params, metadata = {}) {
@@ -1068,7 +652,7 @@ export class Agent {
     try {
       const branch = this.tasks.branch(await session.pi.request('get_entries'));
       session.tools.clear();
-      for (const entry of branch) this.replay(session, entry);
+      for (const entry of branch) this.transcript.replay(session, entry);
       await this.tasks.restore(session, branch, metadata.restoreContext);
       session.tools.clear();
       const state = await session.pi.request('get_state');
@@ -1080,69 +664,6 @@ export class Agent {
       throw error;
     } finally {
       session.changingConfig = false;
-    }
-  }
-
-  publishPlan(session, result, isError = false) {
-    const entries = result?.details?.acpPlan;
-    if (isError || !Array.isArray(entries) || entries.length > 100 || entries.some(entry =>
-      typeof entry?.content !== 'string' || !entry.content || entry.content.length > 10000 ||
-      !['high', 'medium', 'low'].includes(entry.priority) ||
-      !['pending', 'in_progress', 'completed'].includes(entry.status))) return;
-    this.update(session, { sessionUpdate: 'plan', entries });
-  }
-
-  compactionUpdate(session, compactionId, status, result, error) {
-    if (this.clientCapabilities?.session?.compaction != null) {
-      this.update(session, { sessionUpdate: 'compaction_update', compactionId, status,
-        ...(this.protocolVersion === 2 && typeof result?.summary === 'string'
-          ? { summary: [{ type: 'text', text: result.summary }] } : {}),
-        ...(status === 'failed' && error ? { error } : {}) });
-    } else {
-      this.update(session, { sessionUpdate: status === 'in_progress' ? 'tool_call' : 'tool_call_update',
-        toolCallId: compactionId, ...(status === 'in_progress' ? { title: '压缩对话上下文', kind: 'think' } : {}),
-        status: status === 'in_progress' ? 'in_progress' : status === 'completed' ? 'completed' : 'failed',
-        ...(result ? { rawOutput: result } : {}),
-      });
-    }
-  }
-
-  replay(session, entry) {
-    if (entry.type === 'compaction') {
-      const id = `pi-compaction-${entry.id}`;
-      this.compactionUpdate(session, id, 'in_progress');
-      this.compactionUpdate(session, id, 'completed', { summary: entry.summary, tokensBefore: entry.tokensBefore });
-      return;
-    }
-    const message = entry.type === 'message' ? entry.message : null;
-    if (!message) return;
-    if (message.role === 'toolResult') {
-      this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: message.toolCallId,
-        status: message.isError ? 'failed' : 'completed', ...this.toolResult(session, message.toolCallId, message, message.isError) });
-      this.publishPlan(session, message, message.isError);
-      session.tools.delete(message.toolCallId);
-      session.terminals.delete(message.toolCallId);
-      return;
-    }
-    if (!['user', 'assistant'].includes(message.role)) return;
-    const blocks = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content ?? [];
-    for (const block of blocks) {
-      if (block.type === 'toolCall' && message.role === 'assistant') {
-        const tool = this.tool(session, { toolCallId: block.id, toolName: block.name, args: block.arguments });
-        session.tools.set(block.id, tool);
-        const terminal = terminalTools.includes(block.name);
-        if (terminal) session.terminals.set(block.id, '');
-        this.update(session, { sessionUpdate: 'tool_call', ...tool,
-          ...(terminal ? { content: [{ type: 'terminal', terminalId: block.id }],
-            _meta: { terminal_info: { terminal_id: block.id, cwd: session.cwd } } } : {}),
-          status: 'pending' });
-      } else if (block.type === 'thinking' && message.role === 'assistant') {
-        this.update(session, { sessionUpdate: 'agent_thought_chunk', messageId: `${message.acpMessageId ?? entry.id}:thinking`, content: { type: 'text', text: block.thinking } });
-      } else if (['text', 'image'].includes(block.type)) {
-        const content = block.type === 'text' ? { type: 'text', text: block.text }
-          : { type: 'image', data: block.data, mimeType: block.mimeType };
-        this.update(session, { sessionUpdate: message.role === 'user' ? 'user_message_chunk' : 'agent_message_chunk', messageId: message.acpMessageId ?? entry.id, content });
-      }
     }
   }
 
@@ -1182,7 +703,7 @@ export class Agent {
           session.failure = error;
           void this.tasks.close(session, error).catch(logError('关闭后台任务失败'));
           if (session.turn) { session.turn.error = error; session.turn.settle(); }
-          this.cancelPermissions(session);
+          this.interactions.cancel(session);
         } });
       const state = await session.pi.request('get_state');
       session.file = state.sessionFile;
@@ -1209,10 +730,7 @@ export class Agent {
       session.changingConfig = keepBusy;
       const result = this.sessionState(session);
       if (session.goal) this.goalUpdate(session);
-      await Promise.all([
-        this.publishCommands(session).catch(logError('发布命令失败')),
-        this.refreshUsage(session).catch(logError('刷新用量失败')),
-      ]);
+      await this.publishSession(session);
       return result;
     } catch (error) {
       await this.disposeSession(session);
@@ -1235,7 +753,7 @@ export class Agent {
     const originalMode = session.mode;
     session.changingConfig = true;
     try {
-      if (['read-only', 'plan'].includes(modeId)) this.cancelPermissions(session);
+      if (restrictedModes.includes(modeId)) this.interactions.cancel(session);
       session.mode = modeId;
       if ((modeId === 'plan') !== (originalMode === 'plan')) {
         await session.pi.request('prompt', { message: `/__acp_mode ${modeId === 'plan' ? 'plan' : 'default'}` });
@@ -1251,14 +769,7 @@ export class Agent {
         this.update(session, { sessionUpdate: 'current_mode_update', currentModeId: modeId });
         this.update(session, { sessionUpdate: 'config_option_update', configOptions: this.modelConfig(session) });
       }
-      if (modeId === 'full') {
-        for (const [id, permission] of this.permissions) {
-          if (permission.session === session && permission.kind === 'permission') {
-            this.permissions.delete(id);
-            permission.resolve({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
-          }
-        }
-      }
+      if (modeId === 'full') this.interactions.approveAll(session);
     } catch (error) {
       session.mode = originalMode;
       throw error;
@@ -1297,63 +808,6 @@ export class Agent {
     }];
   }
 
-  tool(session, event) {
-    const name = event.toolName;
-    return { toolCallId: event.toolCallId, title: name, kind: toolKind(name),
-      rawInput: event.args,
-      ...(typeof event.args?.path === 'string' ? { locations: [{ path: toolPath(session.cwd, event.args.path) }] } : {}) };
-  }
-
-  content(result) {
-    return (result?.content ?? []).filter(c => ['text', 'image'].includes(c.type))
-      .map(content => ({ type: 'content', content }));
-  }
-
-  terminalOutputKey() {
-    const meta = this.clientCapabilities?._meta;
-    if (meta?.terminal_output_delta === true) return 'terminal_output_delta';
-    if (meta?.terminal_output === true) return 'terminal_output';
-    return null;
-  }
-
-  terminalUpdate(session, toolCallId, result, final = false) {
-    const tool = session.tools.get(toolCallId);
-    if (!terminalTools.includes(tool?.title)) return {};
-    const key = this.terminalOutputKey();
-    const previous = session.terminals.get(toolCallId) ?? '';
-    const contentOutput = result?.content?.find(block => block.type === 'text')?.text;
-    const output = final && previous ? contentOutput
-      : final && typeof result?.structuredContent?.output === 'string' ? result.structuredContent.output : contentOutput;
-    const overlap = typeof output === 'string' ? suffixPrefixOverlap(previous, output) : 0;
-    const delta = key && typeof output === 'string' ? [...output].slice(overlap).join('') : '';
-    if (typeof output === 'string') session.terminals.set(toolCallId, output);
-    const exitCode = result?.structuredContent?.exit_code;
-    return { ...(key || final ? { _meta: {
-      ...(delta ? { [key]: { terminal_id: toolCallId, data: delta } } : {}),
-      ...(final && Number.isInteger(exitCode) ? { terminal_exit: {
-        terminal_id: toolCallId, exit_code: exitCode, signal: null,
-      } } : {}),
-    } } : {}) };
-  }
-
-  toolResult(session, toolCallId, result, isError, final = true) {
-    const tool = session.tools.get(toolCallId);
-    const terminal = this.terminalUpdate(session, toolCallId, result, final);
-    const diffs = fileDiffs(tool, result, isError);
-    const firstChangedLine = result?.details?.firstChangedLine;
-    const line = !isError && Number.isSafeInteger(firstChangedLine) && firstChangedLine > 0 ? firstChangedLine : diffs[0]?.line;
-    const ordinaryContent = this.terminalOutputKey() && terminalTools.includes(tool?.title)
-      ? [] : this.content(result);
-    const patch = diffs.length ? gitPatch(diffs[0].path, result) : undefined;
-    const renderedDiffs = this.airDiffPatch && patch
-      ? [{ type: 'diff', path: diffs[0].path, oldText: null, newText: '', _meta: { kind: patch.kind, jetbrains: { air: {
-        version: 1, diffPatch: { version: 1, format: 'git_patch', text: patch.text },
-      } } } }]
-      : diffs.map(({ line, ...diff }) => diff);
-    return { content: [...ordinaryContent, ...renderedDiffs], rawOutput: result, ...terminal,
-      ...(tool?.locations?.length && line !== undefined ? { locations: [{ path: tool.locations[0].path, line }] } : {}) };
-  }
-
   event(session, event) {
     if (event.type === 'session_info_changed') {
       this.update(session, { sessionUpdate: 'session_info_update', title: event.name ?? null });
@@ -1367,18 +821,18 @@ export class Agent {
     if (event.type === 'compaction_start') {
       session.compaction = (session.compaction ?? 0) + 1;
       session.compactionId = `pi-compaction-${randomUUID()}`;
-      this.compactionUpdate(session, session.compactionId, 'in_progress');
+      this.transcript.compactionUpdate(session, session.compactionId, 'in_progress');
       return;
     }
     if (event.type === 'compaction_end') {
       this.recordUsage(session, event.result?.usage);
-      this.compactionUpdate(session, session.compactionId ?? `pi-compaction-${randomUUID()}`,
+      this.transcript.compactionUpdate(session, session.compactionId ?? `pi-compaction-${randomUUID()}`,
         event.result ? 'completed' : event.aborted ? 'cancelled' : 'failed', event.result, event.errorMessage);
       void this.refreshUsage(session).catch(logError('刷新用量失败'));
       return;
     }
     if (event.type === 'extension_ui_request') {
-      void this.ui(session, event).catch(error => {
+      void this.interactions.handle(session, event).catch(error => {
         process.stderr.write(`扩展交互失败：${error.message}\n`);
         if (!session.pi.closed) session.pi.send({ type: 'extension_ui_response', id: event.id, cancelled: true });
       });
@@ -1389,7 +843,7 @@ export class Agent {
       session.failure = error;
       session.pi.fail(error, () => {
         if (session.turn) { session.turn.error = error; session.turn.settle(); }
-        this.cancelPermissions(session);
+        this.interactions.cancel(session);
       });
       return;
     }
@@ -1432,41 +886,13 @@ export class Agent {
         if (message.stopReason === 'aborted') session.turn.cancelled = true;
         break;
       }
-      case 'tool_execution_start': {
-        const tool = this.tool(session, event);
-        session.tools.set(event.toolCallId, tool);
-        // background_shell 的终端输出由 tasks.watchShell 推送，不经过 session.terminals。
-        if (terminalTools.includes(event.toolName)) session.terminals.set(event.toolCallId, '');
-        this.update(session, { sessionUpdate: 'tool_call', ...tool,
-          ...([...terminalTools, 'background_shell'].includes(event.toolName) ? {
-            content: [{ type: 'terminal', terminalId: event.toolCallId }],
-            _meta: { terminal_info: { terminal_id: event.toolCallId, cwd: session.cwd } },
-          } : {}),
-          status: readOnlyTools.includes(event.toolName) ? 'in_progress' : 'pending' });
+      case 'tool_execution_start':
+        this.transcript.toolStarted(session, event);
         break;
-      }
       case 'tool_execution_update':
-      case 'tool_execution_end': {
-        if ([...this.tasks.tasks.values()].some(task => task.owner === session.id && task.toolCallId === event.toolCallId)) {
-          if (event.type === 'tool_execution_end') session.tools.delete(event.toolCallId);
-          break;
-        }
-        const tool = session.tools.get(event.toolCallId);
-        if (event.type === 'tool_execution_end' && !event.isError && ['edit', 'write'].includes(tool?.title) &&
-            tool.locations?.[0]?.path) session.turn.changedPaths?.add(tool.locations[0].path);
-        this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: event.toolCallId,
-          status: event.type === 'tool_execution_update' ? 'in_progress' : event.isError ? 'failed' : 'completed',
-          ...this.toolResult(session, event.toolCallId, event.result ?? event.partialResult,
-            event.isError || event.type !== 'tool_execution_end', event.type === 'tool_execution_end') });
-        if (event.type === 'tool_execution_end') {
-          session.authorizedTasks?.delete(event.toolCallId);
-          this.publishPlan(session, event.result, event.isError);
-          session.tools.delete(event.toolCallId);
-          session.terminals.delete(event.toolCallId);
-          session.inputTerminals?.delete(event.toolCallId);
-        }
+      case 'tool_execution_end':
+        this.transcript.toolUpdated(session, event);
         break;
-      }
       case 'auto_retry_end':
         if (!event.success) session.turn.error = new Error(event.finalError || '模型重试失败');
         break;
@@ -1482,8 +908,8 @@ export class Agent {
     try {
       if (request.action === 'url_elicitation' || request.action === 'url_elicitation_complete') {
         const result = request.action === 'url_elicitation'
-          ? await this.elicitUrl(session, request.params ?? {})
-          : this.completeUrl(session, request.params?.elicitationId);
+          ? await this.interactions.elicitUrl(session, request.params ?? {})
+          : this.interactions.completeUrl(session, request.params?.elicitationId);
         session.pi.controlResponse(request.id, result);
         return;
       }
@@ -1500,177 +926,12 @@ export class Agent {
     } catch (error) { session.pi.controlResponse(request.id, undefined, error); }
   }
 
-  async elicitUrl(session, params) {
-    const capability = this.clientCapabilities?.elicitation?.url;
-    if (!capability || typeof capability !== 'object' || Array.isArray(capability)) return { action: 'cancel' };
-    if (this.closing || session.failure ||
-        !(session.turn || session.command) || session.turn?.cancelled || session.command?.cancelled) {
-      return { action: 'cancel' };
-    }
-    if (typeof params.message !== 'string' || !params.message.trim() || params.message.length > 10000 ||
-        typeof params.url !== 'string' || params.url.length > 10000) throw invalid('URL 交互参数无效');
-    let url;
-    try { url = new URL(params.url); } catch { throw invalid('URL 交互网址无效'); }
-    if (url.username || url.password || (url.protocol !== 'https:' &&
-        !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))) {
-      throw invalid('URL 交互仅允许 HTTPS 或本机 HTTP，且不能包含用户名或密码');
-    }
-    if (this.urlElicitations.size >= 100) throw invalid('待完成的 URL 交互过多');
-    const elicitationId = randomUUID();
-    const entry = { session, accepted: false };
-    this.urlElicitations.set(elicitationId, entry);
-    try {
-      const result = await this.clientRequest(session, 'elicitation', 'elicitation/create', {
-        sessionId: session.id, mode: 'url', elicitationId, url: params.url, message: params.message,
-      });
-      const action = this.urlElicitations.has(elicitationId) && ['accept', 'decline', 'cancel'].includes(result?.action)
-        ? result.action : 'cancel';
-      entry.accepted = action === 'accept';
-      if (!entry.accepted) this.urlElicitations.delete(elicitationId);
-      // URL 响应只保留决定，凭据及其他 content 不经过扩展通道。
-      return { action, elicitationId };
-    } catch (error) {
-      this.urlElicitations.delete(elicitationId);
-      throw error;
-    }
-  }
-
-  // 向客户端发起请求并等待回复；回复、取消或切换权限模式时由对应路径移除条目。
-  clientRequest(session, kind, method, params) {
-    const id = `acp-${kind}-${++this.sequence}`;
-    const decision = new Promise(resolve => this.permissions.set(id, { session, resolve, kind }));
-    try { this.send({ jsonrpc: '2.0', id, method, params }); }
-    catch (error) { this.permissions.delete(id); throw error; }
-    return decision;
-  }
-
-  completeUrl(session, elicitationId) {
-    const entry = this.urlElicitations.get(elicitationId);
-    if (!entry?.accepted || entry.session !== session) return { completed: false };
-    this.urlElicitations.delete(elicitationId);
-    this.send({ jsonrpc: '2.0', method: 'elicitation/complete', params: { elicitationId } });
-    return { completed: true };
-  }
-
-  async ui(session, event) {
-    if (event.method === 'notify') return this.notify(session, event);
-    if (event.method === 'confirm' && event.title === 'PI_ACP_PERMISSION') return this.requestPermission(session, event);
-    if (['confirm', 'select', 'input', 'editor'].includes(event.method)) return this.elicitForm(session, event);
-  }
-
-  notify(session, event) {
-    const message = event.message ?? '';
-    if (message === 'PI_ACP_READY') {
-      session.ready = true;
-      return;
-    }
-    const prefix = /^PI_ACP_[A-Z_]+:/.exec(message)?.[0];
-    if (prefix && Object.hasOwn(notifyHandlers, prefix)) {
-      notifyHandlers[prefix].call(this, session, message.slice(prefix.length));
-      return;
-    }
-    const notices = this.clientCapabilities?.session?.notices;
-    if (notices && typeof notices === 'object' && !Array.isArray(notices)) {
-      this.update(session, { sessionUpdate: 'notice',
-        severity: event.notifyType === 'error' ? 'error' : event.notifyType === 'warning' ? 'warning' : 'info',
-        title: event.message || 'pi 通知' });
-    }
-  }
-
-  async elicitForm(session, event) {
-    const respond = payload => session.pi.send({ type: 'extension_ui_response', id: event.id, ...payload });
-    if (event.method === 'select' && (!Array.isArray(event.options) || event.options.some(option => typeof option !== 'string'))) {
-      respond({ cancelled: true });
-      return;
-    }
-    if (this.clientCapabilities?.elicitation?.form == null || !(session.turn || session.command) ||
-        session.turn?.cancelled || session.command?.cancelled) {
-      respond({ cancelled: true });
-      if (session.turn) this.update(session, { sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: `\n扩展交互暂不支持：${event.title ?? event.method}\n` } });
-      return;
-    }
-    const property = event.method === 'confirm'
-      ? { type: 'boolean', default: false }
-      : event.method === 'select'
-        ? { type: 'string', enum: event.options }
-        : { type: 'string', ...(event.placeholder ? { description: event.placeholder } : {}),
-          ...(event.prefill !== undefined ? { default: event.prefill } : {}) };
-    const result = await this.clientRequest(session, 'elicitation', 'elicitation/create', {
-      sessionId: session.interactionSessionId ?? session.id, mode: 'form',
-      message: [event.title || 'pi 需要输入', event.message].filter(Boolean).join('\n\n'),
-      requestedSchema: { type: 'object', properties: { value: property }, required: ['value'] },
-    });
-    const value = result?.content?.value;
-    const accepted = result?.action === 'accept' &&
-      (event.method === 'confirm' ? typeof value === 'boolean'
-        : typeof value === 'string' && (event.method !== 'select' || event.options.includes(value)));
-    respond(accepted ? event.method === 'confirm' ? { confirmed: value } : { value } : { cancelled: true });
-  }
-
-  async requestPermission(session, event) {
-    const respond = payload => session.pi.send({ type: 'extension_ui_response', id: event.id, ...payload });
-    const call = JSON.parse(event.message);
-    if (session.turn?.cancelled) {
-      respond({ cancelled: true });
-      return;
-    }
-    if (['read-only', 'plan'].includes(session.mode)) {
-      respond({ confirmed: false });
-      return;
-    }
-    if (session.mode === 'full') {
-      this.authorizeTool(session, call);
-      respond({ confirmed: true });
-      this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: call.toolCallId, status: 'in_progress' });
-      return;
-    }
-    if (!session.turn) {
-      respond({ cancelled: true });
-      return;
-    }
-    const tool = session.tools.get(call.toolCallId) ?? this.tool(session, call);
-    const result = await this.clientRequest(session, 'permission', 'session/request_permission', {
-      sessionId: session.interactionSessionId ?? session.id, toolCall: { ...tool, status: 'pending' }, options: [
-        { optionId: 'allow-once', name: '允许本次', kind: 'allow_once' },
-        { optionId: 'allow-session', name: '本会话允许全部工具', kind: 'allow_always' },
-        { optionId: 'reject-once', name: '拒绝本次', kind: 'reject_once' },
-      ] });
-    const approved = !['read-only', 'plan'].includes(session.mode) && !session.turn?.cancelled &&
-      result?.outcome?.outcome === 'selected' &&
-      ['allow-once', 'allow-session'].includes(result.outcome.optionId);
-    if (approved && result.outcome.optionId === 'allow-session') await this.setMode(session, 'full');
-    if (approved) this.authorizeTool(session, call);
-    if (!session.pi.closed) respond({ confirmed: approved });
-    if (approved) this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: call.toolCallId, status: 'in_progress' });
-  }
-
-  // 非只读工具需要先经过授权，任务工具在 control 中据此放行。
-  authorizeTool(session, call) {
-    if (!readOnlyTools.includes(call.toolName)) (session.authorizedTasks ??= new Set()).add(call.toolCallId);
-  }
-
-  cancelPermissions(session, { keepAcceptedUrls = false } = {}) {
-    for (const [id, entry] of this.urlElicitations) {
-      if (entry.session === session && !(keepAcceptedUrls && entry.accepted)) this.urlElicitations.delete(id);
-    }
-    for (const [id, permission] of this.permissions) {
-      if (permission.session === session) {
-        this.permissions.delete(id);
-        permission.resolve(undefined);
-      }
-    }
-  }
-
   async close() {
     this.closing = true;
-    for (const subscription of this.subscriptions.values()) {
-      subscription.active = false;
-      clearInterval(subscription.timer);
-    }
+    this.index.close();
     await Promise.allSettled([...this.lifecycleOperations.values()]);
     await Promise.all([...this.sessions.values()].filter(session => !session.parentId).map(async session => {
-      this.cancelPermissions(session);
+      this.interactions.cancel(session);
       try {
         await this.tasks.close(session);
         await session.taskWrites;
@@ -1680,6 +941,5 @@ export class Agent {
     }));
     this.sessions.clear();
     this.lifecycleOperations.clear();
-    this.subscriptions.clear();
   }
 }

@@ -9,7 +9,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { readJsonl, writeJsonl } from '../src/jsonl.js';
-import { Agent, convertMcp, convertPrompt } from '../src/agent.js';
+import { Agent } from '../src/agent.js';
+import { convertMcp, convertPrompt } from '../src/convert.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const fixture = fileURLToPath(new URL('../fixtures/pi.js', import.meta.url));
@@ -469,7 +470,7 @@ test('完全访问放行 remote-pi 无 ACP 轮次的工具调用，保留其他�
       const responses = [];
       const agent = new Agent({ send: record => records.push(record) });
       const session = { id: 'remote', mode, turn, pi: { send: response => responses.push(response) } };
-      await agent.ui(session, { id: 'ui-remote', method: 'confirm', title: 'PI_ACP_PERMISSION',
+      await agent.interactions.handle(session, { id: 'ui-remote', method: 'confirm', title: 'PI_ACP_PERMISSION',
         message: JSON.stringify({ toolCallId: 'remote-bash', toolName: 'bash', args: { command: 'pwd' } }) });
       const approved = mode === 'full' && turn === null;
       assert.deepEqual(responses, [{ type: 'extension_ui_response', id: 'ui-remote',
@@ -881,7 +882,7 @@ test('扩展表单交互通过 elicitation 桥接，并保留无能力时的取�
   const agent = new Agent({ send: record => records.push(record) });
   agent.clientCapabilities = { elicitation: { form: {} } };
   const session = { id: 'ui', turn: {}, pi: { closed: false, send: response => responses.push(response) } };
-  const pending = agent.ui(session, { id: 'ui-1', method: 'select', title: '选择颜色', options: ['红', '蓝'] });
+  const pending = agent.interactions.handle(session, { id: 'ui-1', method: 'select', title: '选择颜色', options: ['红', '蓝'] });
   while (!records.length) await new Promise(resolve => setImmediate(resolve));
   assert.equal(records[0].method, 'elicitation/create');
   assert.equal(records[0].params.message, '选择颜色');
@@ -890,17 +891,17 @@ test('扩展表单交互通过 elicitation 桥接，并保留无能力时的取�
   await pending;
   assert.deepEqual(responses[0], { type: 'extension_ui_response', id: 'ui-1', value: '蓝' });
   agent.clientCapabilities = {};
-  await agent.ui(session, { id: 'ui-2', method: 'input', title: '输入值' });
+  await agent.interactions.handle(session, { id: 'ui-2', method: 'input', title: '输入值' });
   assert.deepEqual(responses.at(-1), { type: 'extension_ui_response', id: 'ui-2', cancelled: true });
   agent.clientCapabilities = { elicitation: { form: {} } };
   const requests = () => records.filter(record => record.method === 'elicitation/create');
-  const rejected = agent.ui(session, { id: 'ui-3', method: 'select', title: '严格选择', options: ['A'] });
+  const rejected = agent.interactions.handle(session, { id: 'ui-3', method: 'select', title: '严格选择', options: ['A'] });
   while (requests().length < 2) await new Promise(resolve => setImmediate(resolve));
   await agent.receive({ jsonrpc: '2.0', id: requests()[1].id,
     result: { action: 'accept', content: { value: 'B' } } });
   await rejected;
   assert.deepEqual(responses.at(-1), { type: 'extension_ui_response', id: 'ui-3', cancelled: true });
-  const confirmed = agent.ui(session, { id: 'ui-4', method: 'confirm', title: '删除？', message: '所有数据将丢失' });
+  const confirmed = agent.interactions.handle(session, { id: 'ui-4', method: 'confirm', title: '删除？', message: '所有数据将丢失' });
   while (requests().length < 3) await new Promise(resolve => setImmediate(resolve));
   assert.equal(requests()[2].params.message, '删除？\n\n所有数据将丢失');
   await agent.receive({ jsonrpc: '2.0', id: requests()[2].id,
@@ -913,10 +914,10 @@ test('扩展通知仅在 notice 能力协商后发送', async () => {
   const updates = [];
   const agent = new Agent({ send: record => updates.push(record.params.update) });
   const session = { id: 'notice' };
-  await agent.ui(session, { method: 'notify', message: '需要注意', notifyType: 'warning' });
+  await agent.interactions.handle(session, { method: 'notify', message: '需要注意', notifyType: 'warning' });
   assert.equal(updates.length, 0);
   agent.clientCapabilities = { session: { notices: {} } };
-  await agent.ui(session, { method: 'notify', message: '需要注意', notifyType: 'warning' });
+  await agent.interactions.handle(session, { method: 'notify', message: '需要注意', notifyType: 'warning' });
   assert.deepEqual(updates[0], { sessionUpdate: 'notice', severity: 'warning', title: '需要注意' });
 });
 
@@ -980,10 +981,10 @@ test('终端工具按客户端能力发送累计输出增量和退出码', () =>
   assert.equal(records[2]._meta.terminal_output_delta.data, 'st');
   session.tools.set('bash-1', { title: 'bash' });
   session.terminals.set('bash-1', 'abcdef');
-  const reset = agent.terminalUpdate(session, 'bash-1', { content: [{ type: 'text', text: 'defghi' }] });
+  const reset = agent.transcript.terminalUpdate(session, 'bash-1', { content: [{ type: 'text', text: 'defghi' }] });
   assert.equal(reset._meta.terminal_output_delta.data, 'ghi');
   session.terminals.set('bash-1', '前😀后');
-  const unicode = agent.terminalUpdate(session, 'bash-1', { content: [{ type: 'text', text: '😀后来' }] });
+  const unicode = agent.transcript.terminalUpdate(session, 'bash-1', { content: [{ type: 'text', text: '😀后来' }] });
   assert.equal(unicode._meta.terminal_output_delta.data, '来');
   assert.equal(records[3]._meta.terminal_exit.exit_code, 0);
   assert.deepEqual(records[3].content, []);

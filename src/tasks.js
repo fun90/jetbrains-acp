@@ -3,8 +3,8 @@ import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { invalid, restrictedModes } from './shared.js';
 
-const invalid = message => Object.assign(new Error(message), { code: -32602 });
 const running = task => task.state === 'running';
 const MAX_OUTPUT = 256 * 1024;
 
@@ -144,8 +144,8 @@ export class Tasks {
           task.output = state.output;
           task.truncated = state.truncated === true;
           if (delta) this.agent.update(session, { sessionUpdate: 'tool_call_update', toolCallId: task.toolCallId,
-            ...(this.agent.terminalOutputKey() ? { _meta: {
-              [this.agent.terminalOutputKey()]: { terminal_id: task.toolCallId, data: delta },
+            ...(this.agent.transcript.terminalOutputKey() ? { _meta: {
+              [this.agent.transcript.terminalOutputKey()]: { terminal_id: task.toolCallId, data: delta },
             } } : { content: [{ type: 'content', content: { type: 'text', text: task.output } }] }) });
           if (state.state !== 'running') {
             clearInterval(task.timer);
@@ -185,6 +185,10 @@ export class Tasks {
       branch.push(entry);
     }
     return branch.reverse();
+  }
+
+  ownedBy(sessionId) {
+    return [...this.tasks.values()].filter(task => task.owner === sessionId);
   }
 
   relation(childId) {
@@ -288,7 +292,7 @@ export class Tasks {
     if (session.changingConfig || session.failure || session.turn?.cancelled || this.agent.closing) {
       throw invalid('会话当前不能启动任务');
     }
-    if (['read-only', 'plan'].includes(session.mode)) throw invalid('当前权限模式不允许启动任务');
+    if (restrictedModes.includes(session.mode)) throw invalid('当前权限模式不允许启动任务');
     const text = kind === 'agent' ? params.prompt : params.command;
     if (typeof text !== 'string' || !text.trim() || text.length > 100000 ||
         (params.name !== undefined && (typeof params.name !== 'string' || params.name.length > 10000))) throw invalid('任务内容无效');
@@ -307,7 +311,7 @@ export class Tasks {
     try {
       await this.save(session, task);
       if (task.controller.signal.aborted || session.turn?.cancelled || this.agent.closing ||
-          ['read-only', 'plan'].includes(session.mode)) throw invalid('任务已停止或权限已变更');
+          restrictedModes.includes(session.mode)) throw invalid('任务已停止或权限已变更');
       if (kind === 'agent') {
         try {
           await this.agent.newSession({ cwd: session.cwd, mcpServers: session.mcpServers,
@@ -321,7 +325,7 @@ export class Tasks {
           await child.pi.request('set_thinking_level', { level: session.thinkingLevel });
           await this.agent.refreshThinking(child);
           await this.agent.setMode(child, session.mode);
-          if (task.controller.signal.aborted || session.turn?.cancelled || this.agent.closing || ['read-only', 'plan'].includes(session.mode)) throw invalid('任务已停止或权限已变更');
+          if (task.controller.signal.aborted || session.turn?.cancelled || this.agent.closing || restrictedModes.includes(session.mode)) throw invalid('任务已停止或权限已变更');
           if (this.agent.nativeSubagents) this.agent.update(session, { sessionUpdate: 'subagent_spawned',
             subagentSessionId: child.id, name: params.name || '子 agent', task: text,
             capabilities: { cancel: true, close: true } });
@@ -383,7 +387,7 @@ export class Tasks {
   }
 
   async close(session, error) {
-    await Promise.all([...this.tasks.values()].filter(task => task.owner === session.id).map(async task => {
+    await Promise.all(this.ownedBy(session.id).map(async task => {
       try {
         if (running(task) && error) {
           task.failure = error;

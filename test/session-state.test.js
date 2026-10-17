@@ -41,9 +41,9 @@ test('每轮用量累加模型与压缩请求，取消仍保留已发生用量�
 test('分叉来源只向协商会话索引的客户端发布且不暴露存储路径', () => {
   const agent = new Agent({ send: () => {} });
   const info = { sessionId: 'child', cwd: '/repo', path: '/private/child.jsonl', forkedFrom: 'parent' };
-  assert.deepEqual(agent.sessionInfo(info), { sessionId: 'child', cwd: '/repo' });
+  assert.deepEqual(agent.index.info(info), { sessionId: 'child', cwd: '/repo' });
   agent.airIndex = true;
-  const result = agent.sessionInfo(info);
+  const result = agent.index.info(info);
   assert.equal(result._meta.jetbrains.air.forkedFrom, 'parent');
   assert.equal('path' in result, false);
   assert.equal('forkedFrom' in result, false);
@@ -80,7 +80,7 @@ test('无效分叉点参数不打开或修改源会话', async () => {
   for (const fork of [null, [], {}, { version: 2, messageId: 'old' },
     { version: 1, messageId: ' ' }, { version: 1, messageId: 'old', messageFingerprint: 'bad' },
     { version: 1, messageId: 'old', messageOccurrence: 0 }]) {
-    await assert.rejects(agent.forkSession({ sessionId: 'source', _meta: { jetbrains: { air: { fork } } } }),
+    await assert.rejects(agent.forks.fork({ sessionId: 'source', _meta: { jetbrains: { air: { fork } } } }),
       { code: -32602, message: '分叉点参数无效' });
   }
   assert.equal(agent.sessions.size, 0);
@@ -98,7 +98,7 @@ test('指定消息分叉取消后保留源会话并解除操作锁', async () =>
   } });
   current.mcpServers = [];
   agent.sessions.set(current.id, current);
-  await assert.rejects(agent.forkSession({ sessionId: 'source', _meta: { jetbrains: { air: {
+  await assert.rejects(agent.forks.fork({ sessionId: 'source', _meta: { jetbrains: { air: {
     fork: { version: 1, messageId: 'reply' },
   } } } }), { code: -32602, message: 'pi 未执行指定消息分叉' });
   assert.equal(agent.sessions.get('source'), current);
@@ -135,7 +135,7 @@ test('clone 已接受但读取新会话失败时解除错误会话映射', async
   }, close: async () => { closed = true; } });
   current.directory = directory;
   agent.sessions.set(current.id, current);
-  await assert.rejects(agent.cloneSession(current, { sessionId: 'source' }, current.cwd), /新状态丢失/);
+  await assert.rejects(agent.forks.clone(current, { sessionId: 'source' }, current.cwd), /新状态丢失/);
   assert.equal(closed, true);
   assert.equal(agent.sessions.size, 0);
   await assert.rejects(stat(directory), { code: 'ENOENT' });
@@ -178,10 +178,10 @@ test('切完全访问不会把普通输入表单当成工具权限自动允许',
   agent.clientCapabilities = { elicitation: { form: {} } };
   const current = session('form', { closed: false, send: record => responses.push(record) });
   current.turn = {};
-  const input = agent.ui(current, { method: 'input', id: 'input-1', title: '输入项目名' });
+  const input = agent.interactions.handle(current, { method: 'input', id: 'input-1', title: '输入项目名' });
   const request = records.find(record => record.method === 'elicitation/create');
   await agent.setMode(current, 'full');
-  assert.equal(agent.permissions.size, 1);
+  assert.equal(agent.interactions.pending.size, 1);
   assert.equal(responses.length, 0);
   await agent.receive({ jsonrpc: '2.0', id: request.id, result: { action: 'accept', content: { value: '项目一' } } });
   await input;
@@ -213,12 +213,12 @@ test('计划输出验证结构，实时与回放使用相同数据', () => {
   const agent = new Agent({ send: record => updates.push(record.params.update) });
   const current = { id: 'plan', tools: new Map(), terminals: new Map() };
   const entries = [{ content: '执行验证', priority: 'high', status: 'in_progress' }];
-  agent.publishPlan(current, { details: { acpPlan: entries } });
+  agent.transcript.publishPlan(current, { details: { acpPlan: entries } });
   assert.deepEqual(updates[0], { sessionUpdate: 'plan', entries });
-  agent.publishPlan(current, { details: { acpPlan: [{ ...entries[0], status: 'unknown' }] } });
-  agent.publishPlan(current, { details: { acpPlan: entries } }, true);
+  agent.transcript.publishPlan(current, { details: { acpPlan: [{ ...entries[0], status: 'unknown' }] } });
+  agent.transcript.publishPlan(current, { details: { acpPlan: entries } }, true);
   assert.equal(updates.length, 1);
-  agent.replay(current, { type: 'message', message: { role: 'toolResult', toolCallId: 'plan-1',
+  agent.transcript.replay(current, { type: 'message', message: { role: 'toolResult', toolCallId: 'plan-1',
     content: [], details: { acpPlan: entries }, isError: false } });
   assert.deepEqual(updates.at(-1), updates[0]);
 });
@@ -228,11 +228,11 @@ test('压缩历史回放在已协商与旧客户端使用对应展示', () => {
   const agent = new Agent({ send: record => updates.push(record.params.update) });
   const current = { id: 'history' };
   const entry = { type: 'compaction', id: 'compact-1', summary: '真实摘要', tokensBefore: 500 };
-  agent.replay(current, entry);
+  agent.transcript.replay(current, entry);
   assert.equal(updates[0].sessionUpdate, 'tool_call');
   assert.equal(updates[1].rawOutput.summary, '真实摘要');
   agent.clientCapabilities = { session: { compaction: {} } };
-  agent.replay(current, entry);
+  agent.transcript.replay(current, entry);
   assert.deepEqual(updates.slice(2).map(update => [update.sessionUpdate, update.status]), [
     ['compaction_update', 'in_progress'], ['compaction_update', 'completed'],
   ]);

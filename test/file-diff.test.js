@@ -84,7 +84,7 @@ test('Air diffPatch 能力协商后发送单个 Git patch', () => {
   const writeResult = { details: { patch: '@@ -0,0 +1 @@\n+new\n',
     acpDiff: { path: '/workspace/a.txt', oldText: null, newText: 'new\n' } } };
   session.tools.set('write-1', { title: 'write', locations: [{ path: '/workspace/a.txt' }] });
-  const rendered = agent.toolResult(session, 'write-1', writeResult, false);
+  const rendered = agent.transcript.toolResult(session, 'write-1', writeResult, false);
   assert.equal(rendered.content.length, 1);
   assert.match(rendered.content[0]._meta.jetbrains.air.diffPatch.text,
     /^diff --git a\/workspace\/a\.txt b\/workspace\/a\.txt\nnew file mode 100644\n--- \/dev\/null\n\+\+\+ b\/workspace\/a\.txt\n@@ /);
@@ -96,7 +96,7 @@ test('Air patch 支持特殊路径和空新增文件，并可由 Git 解析', ()
   const session = { id: 'special', tools: new Map(), terminals: new Map() };
   for (const path of ['/workspace/文件.txt', '/workspace/a b.txt', '/workspace/a"b.txt', '/workspace/a\tb.txt']) {
     session.tools.set('edit', { title: 'edit', locations: [{ path }] });
-    const result = agent.toolResult(session, 'edit', { content: [], details: { patch } }, false);
+    const result = agent.transcript.toolResult(session, 'edit', { content: [], details: { patch } }, false);
     assert.equal(result.content.filter(block => block.type === 'diff').length, 1);
     const text = result.content[0]._meta.jetbrains.air.diffPatch.text;
     assert.equal(execFileSync('git', ['apply', '--numstat', '-z'], { input: text, encoding: 'utf8' }),
@@ -104,7 +104,7 @@ test('Air patch 支持特殊路径和空新增文件，并可由 Git 解析', ()
     assert.equal(result.content[0].path, path);
   }
   session.tools.set('empty', { title: 'write', locations: [{ path: '/workspace/empty.txt' }] });
-  const result = agent.toolResult(session, 'empty', { content: [], details: {
+  const result = agent.transcript.toolResult(session, 'empty', { content: [], details: {
     patch: '--- empty.txt\n+++ empty.txt\n', acpDiff: { path: '/workspace/empty.txt', oldText: null, newText: '' },
   } }, false);
   const text = result.content[0]._meta.jetbrains.air.diffPatch.text;
@@ -127,10 +127,10 @@ test('实时完成与历史回放发送相同 diff 和修改行号，部分输�
   assert.deepEqual(completed.locations, [{ path: '/workspace/a.txt', line: 3 }]);
   assert.equal(completed.rawOutput, result);
   assert.equal(session.tools.size, 0);
-  agent.replay(session, { type: 'message', message: { role: 'assistant', content: [
+  agent.transcript.replay(session, { type: 'message', message: { role: 'assistant', content: [
     { type: 'toolCall', id: call.toolCallId, name: call.toolName, arguments: call.args },
   ] } });
-  agent.replay(session, { type: 'message', message: { role: 'toolResult', toolCallId: call.toolCallId, ...result, isError: false } });
+  agent.transcript.replay(session, { type: 'message', message: { role: 'toolResult', toolCallId: call.toolCallId, ...result, isError: false } });
   assert.deepEqual(records.at(-1).content, completed.content);
   assert.deepEqual(records.at(-1).locations, completed.locations);
   assert.equal(session.tools.size, 0);

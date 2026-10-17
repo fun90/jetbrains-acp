@@ -220,7 +220,7 @@ test('v2 多个并发交互全部回答后才恢复 running，取消后的迟到
   const { protocol, records } = await setup();
   protocol.active.set('s', { started: true, inserted: true });
   for (const id of [10, 11]) {
-    protocol.agent.permissions.set(id, { resolve() {} });
+    protocol.agent.interactions.pending.set(id, { resolve() {} });
     protocol.output({ jsonrpc: '2.0', id, method: 'session/request_permission', params: {
       sessionId: 's', toolCall: { toolCallId: `tool-${id}`, title: '授权' }, options: [],
     } });
@@ -242,12 +242,12 @@ test('v2 自主执行等待授权时报告 requires_action，折叠后台子会�
   const permission = id => ({ jsonrpc: '2.0', id, method: 'session/request_permission', params: {
     sessionId: 's', toolCall: { toolCallId: `tool-${id}`, title: '授权' }, options: [],
   } });
-  protocol.agent.permissions.set(10, { resolve() {}, session: { id: 's' } });
+  protocol.agent.interactions.pending.set(10, { resolve() {}, session: { id: 's' } });
   protocol.output(permission(10));
   assert.equal(protocol.states.get('s'), 'requires_action');
   await protocol.receive({ jsonrpc: '2.0', id: 10, result: { outcome: { outcome: 'cancelled' } } });
   assert.equal(protocol.states.get('s'), 'running');
-  protocol.agent.permissions.set(11, { resolve() {}, session: { id: 'child', parentId: 's' } });
+  protocol.agent.interactions.pending.set(11, { resolve() {}, session: { id: 'child', parentId: 's' } });
   const count = records.filter(record => record.params?.update?.sessionUpdate === 'state_update').length;
   protocol.output(permission(11));
   assert.equal(protocol.states.get('s'), 'running');

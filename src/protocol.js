@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { Agent, convertPrompt } from './agent.js';
+import { Agent } from './agent.js';
+import { convertPrompt } from './convert.js';
 import { gitPatch } from './file-diff.js';
+import { invalid } from './shared.js';
 
-const invalid = message => Object.assign(new Error(message), { code: -32602 });
 const options = values => values.map(({ id, ...option }) => ({ configId: id, ...option }));
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const failure = error => ({ code: Number.isInteger(error.code) ? error.code : -32603, message: error.message });
@@ -99,7 +100,7 @@ export class ProtocolAgent {
   finish(job, result) {
     if (['error', 'cancelled'].includes(result.stopReason)) {
       for (const toolCallId of job.tools) {
-        if ([...this.agent.tasks.tasks.values()].some(task => task.owner === job.sessionId && task.toolCallId === toolCallId)) continue;
+        if (this.agent.tasks.ownedBy(job.sessionId).some(task => task.toolCallId === toolCallId)) continue;
         this.output({ jsonrpc: '2.0', method: 'session/update',
           params: { sessionId: job.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId,
             status: result.stopReason === 'cancelled' ? 'cancelled' : 'failed' } } });
@@ -135,7 +136,7 @@ export class ProtocolAgent {
     if (!record.method) {
       const sessionId = this.interactions.get(record.id);
       this.interactions.delete(record.id);
-      if (sessionId && this.agent.permissions.has(record.id) && this.states.get(sessionId) === 'requires_action' &&
+      if (sessionId && this.agent.interactions.pending.has(record.id) && this.states.get(sessionId) === 'requires_action' &&
           !this.active.get(sessionId)?.cancelled && ![...this.interactions.values()].includes(sessionId)) {
         this.state(sessionId, 'running');
       }
@@ -263,7 +264,7 @@ export class ProtocolAgent {
     }
     if (record.method === 'session/request_permission' || record.method === 'elicitation/create') {
       const sessionId = record.params.sessionId;
-      const owner = this.agent.permissions.get(record.id)?.session;
+      const owner = this.agent.interactions.pending.get(record.id)?.session;
       if ((!owner?.parentId || owner.id === sessionId) && !this.active.get(sessionId)?.cancelled &&
           (this.active.get(sessionId)?.started || this.active.get(sessionId)?.inserted ||
             ['running', 'requires_action'].includes(this.states.get(sessionId)))) {
