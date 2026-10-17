@@ -17,7 +17,7 @@ export class TerminalProcesses {
   async input(params) {
     validateTerminalInput(params);
     const child = this.processes.get(params.terminalId);
-    if (!child || child.exitCode !== null || child.signalCode !== null || !child.stdin.writable) {
+    if (!child || child.exitCode !== null || child.signalCode !== null || !child.stdin?.writable) {
       throw new Error(t('terminalUnavailable'));
     }
     await new Promise((resolve, reject) => {
@@ -43,18 +43,19 @@ export class TerminalProcesses {
     for (const child of this.processes.values()) this.kill(child);
   }
 
-  async exec(terminalId, shell, command, cwd, { onData, signal, timeout, env }, ready) {
+  async exec(terminalId, shell, command, cwd, { onData, signal, timeout, env, interactive }, ready) {
     if (signal?.aborted) throw new Error('aborted');
     if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0 || timeout * 1000 > 2147483647)) {
       throw new Error('Invalid timeout');
     }
     // shortcut: stdin 管道不提供 PTY；需要全屏程序、终端尺寸或 tty 密码提示时再接入 PTY。
     if (shell.commandTransport === 'stdin') throw new Error(t('shellStdinTransport'));
+    // 非交互命令的 stdin 用 /dev/null，与 pi 原生一致，避免误读 stdin 的命令一直卡住。
     const child = spawn(shell.shell, [...shell.args, command], {
-      cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true,
+      cwd, env, stdio: [interactive ? 'pipe' : 'ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true,
     });
     this.processes.set(terminalId, child);
-    child.stdin.on('error', () => {});
+    child.stdin?.on('error', () => {});
     child.stdout.on('data', data => onData(data, 'stdout'));
     child.stderr.on('data', data => onData(data, 'stderr'));
     let timedOut = false;
@@ -70,7 +71,7 @@ export class TerminalProcesses {
           clearTimeout(idleTimer);
           child.stdout.destroy();
           child.stderr.destroy();
-          child.stdin.destroy();
+          child.stdin?.destroy();
           resolve(code ?? 128 + (constants.signals[child.signalCode] ?? 0));
         };
         const drain = () => {
@@ -81,7 +82,7 @@ export class TerminalProcesses {
         child.stdout.on('data', drain);
         child.stderr.on('data', drain);
         child.once('error', reject);
-        child.once('spawn', ready);
+        if (interactive) child.once('spawn', ready);
         child.once('close', finish);
         child.once('exit', () => { exited = true; drain(); });
       });

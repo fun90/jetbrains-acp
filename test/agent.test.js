@@ -208,7 +208,7 @@ for (const version of [1, 2]) {
           const reason = call ? 'toolUse' : 'stop';
           const message = { role: 'assistant',
             content: call ? [{ type: 'toolCall', id: 'stdin-' + step, name: 'bash',
-              arguments: { command: 'printf ready; cat', timeout: 10 } }] : [{ type: 'text', text: '完成' }],
+              arguments: { command: 'printf ready; cat', timeout: 10, interactive: true } }] : [{ type: 'text', text: '完成' }],
             api: model.api, provider: model.provider, model: model.id, stopReason: reason, timestamp: Date.now(),
             usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
               cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };

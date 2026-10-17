@@ -79,13 +79,17 @@ export default function (pi: any) {
       const createTool = name === 'bash' ? createBashToolDefinition : createPowerShellToolDefinition;
       const definition = createTool(process.cwd());
       pi.registerTool({ ...definition,
+        parameters: Type.Object({ ...definition.parameters.properties,
+          interactive: Type.Optional(Type.Boolean({ description: 'Set true only when the command must read input typed by the user on stdin. ' +
+            'Default false: stdin is empty (/dev/null) and no input can be sent while it runs.' })) }),
         execute: async (id: string, args: any, signal: AbortSignal, update: any, ctx: any) => {
+          const interactive = args.interactive === true;
           const settings = SettingsManager.create(ctx.cwd);
           const tool = createTool(ctx.cwd, {
             commandPrefix: settings.getShellCommandPrefix(),
             operations: { exec: (command: string, cwd: string, options: any) => terminals.exec(id,
               name === 'bash' ? getShellConfig(settings.getShellPath()) : getPowerShellConfig(),
-              command, cwd, options, () => ctx.ui.notify(`PI_ACP_TERMINAL_READY:${id}`, 'info')) },
+              command, cwd, { ...options, interactive }, () => ctx.ui.notify(`PI_ACP_TERMINAL_READY:${id}`, 'info')) },
           });
           return tool.execute(id, args, signal, update, ctx);
         },

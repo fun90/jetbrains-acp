@@ -11,7 +11,7 @@
 1. 在终端中登录模型提供商：
 
    ```bash
-   npx --yes jetbrains-pi-acp@0.1.3 --setup
+   npx --yes jetbrains-pi-acp@0.1.4 --setup
    ```
 
    在 pi 中运行 `/login`，完成登录后退出 pi 并返回 IDE。凭据由 pi 管理。
@@ -23,7 +23,7 @@
      "agent_servers": {
        "pi": {
          "command": "npx",
-         "args": ["--yes", "jetbrains-pi-acp@0.1.3"],
+         "args": ["--yes", "jetbrains-pi-acp@0.1.4"],
          "use_idea_mcp": true,
          "use_custom_mcp": true
        }
@@ -53,7 +53,7 @@ IDE 必须能找到 `npx`，必要时使用其绝对路径。菜单位置随 IDE
 在 Agent 的 `args` 末尾添加 `--`，随后传递 pi 参数，例如：
 
 ```json
-["--yes", "jetbrains-pi-acp@0.1.3", "--", "--model", "provider/model-id", "--thinking", "medium"]
+["--yes", "jetbrains-pi-acp@0.1.4", "--", "--model", "provider/model-id", "--thinking", "medium"]
 ```
 
 这里只传配置选项，不传初始提示、交互模式或会话选择参数。RPC 模式和会话由适配器管理。
@@ -68,6 +68,7 @@ IDE 必须能找到 `npx`，必要时使用其绝对路径。菜单位置随 IDE
 
 - 工具由本机 pi 执行，尚未接入客户端 `fs/*` 和 `terminal/*` 执行接口。让 Agent 读取或修改文件前，请保存编辑器内容。
 - 终端输入使用 stdin 管道，不提供 PTY，不支持全屏终端应用和 TTY 密码提示；后台任务不支持 stdin 输入。
+- 只有模型以 `interactive: true` 调用的命令可以接收输入；其他命令与 pi 原生一致，stdin 为空（`/dev/null`），误读 stdin 的命令会直接结束，不会卡住。
 - diff 有大小限制，二进制文件或旧历史可能无法展示。每轮文件报告的单次快照最多扫描 20,000 项或两秒，无法准确区分外部并发修改。
 - 不支持 MCP SSE、音频和二进制内嵌资源，图片支持取决于模型。
 - ACP v2 仍为草案，客户端界面展示、真实提供商账号登录及 Windows 实机仍需验证。

@@ -11,7 +11,7 @@ function start(terminals, id, command, options = {}) {
   const started = new Promise(resolve => { ready = resolve; });
   let output = '';
   const completed = terminals.exec(id, shell, command, cwd,
-    { env: process.env, onData: data => { output += data.toString(); }, ...options }, ready);
+    { env: process.env, onData: data => { output += data.toString(); }, interactive: true, ...options }, ready);
   return { started, completed, output: () => output };
 }
 
@@ -57,6 +57,22 @@ test('等待 stdin 的命令可以取消、超时和关闭', async () => {
   await closed.started;
   terminals.close();
   assert.notEqual((await closed.completed).exitCode, 0);
+  assert.equal(terminals.processes.size, 0);
+});
+
+test('非交互命令的 stdin 为 /dev/null：读 stdin 不卡住、不可输入、不通知就绪', async () => {
+  const terminals = new TerminalProcesses();
+  let readied = false;
+  const run = start(terminals, 'plain', 'cat; echo 结束', { interactive: false });
+  run.started.then(() => { readied = true; });
+  assert.deepEqual(await run.completed, { exitCode: 0 });
+  assert.equal(run.output(), '结束\n');
+  assert.equal(readied, false);
+  const controller = new AbortController();
+  const sleeping = start(terminals, 'sleep', 'sleep 5', { interactive: false, signal: controller.signal });
+  await assert.rejects(terminals.input({ terminalId: 'sleep', data: 'x' }), { message: msg('terminalUnavailable') });
+  controller.abort();
+  await assert.rejects(sleeping.completed, /aborted/);
   assert.equal(terminals.processes.size, 0);
 });
 

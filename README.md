@@ -11,7 +11,7 @@ Requires **Node.js 22.19.0+** and a JetBrains IDE with ACP support, such as Inte
 1. Sign in to your model provider from a terminal:
 
    ```bash
-   npx --yes jetbrains-pi-acp@0.1.3 --setup
+   npx --yes jetbrains-pi-acp@0.1.4 --setup
    ```
 
    In pi, run `/login`, complete sign-in, then exit pi and return to the IDE. Credentials are managed by pi.
@@ -23,7 +23,7 @@ Requires **Node.js 22.19.0+** and a JetBrains IDE with ACP support, such as Inte
      "agent_servers": {
        "pi": {
          "command": "npx",
-         "args": ["--yes", "jetbrains-pi-acp@0.1.3"],
+         "args": ["--yes", "jetbrains-pi-acp@0.1.4"],
          "use_idea_mcp": true,
          "use_custom_mcp": true
        }
@@ -52,7 +52,7 @@ The IDE must be able to find `npx`; use its absolute path if needed. Menu locati
 Append pi options after `--` in the agent's `args`, for example:
 
 ```json
-["--yes", "jetbrains-pi-acp@0.1.3", "--", "--model", "provider/model-id", "--thinking", "medium"]
+["--yes", "jetbrains-pi-acp@0.1.4", "--", "--model", "provider/model-id", "--thinking", "medium"]
 ```
 
 Use configuration options here, not initial prompts, interactive mode, or session-selection arguments. The adapter manages RPC mode and sessions.
@@ -67,6 +67,7 @@ Restart the agent connection after updating the adapter or changing startup opti
 
 - Tools execute locally through pi; ACP client-side `fs/*` and `terminal/*` execution is not implemented. Save editor buffers before asking the agent to read or change files.
 - Terminal input uses stdin pipes, not a PTY. Full-screen apps and TTY password prompts are unsupported; background tasks have no stdin input.
+- Only commands the model runs with `interactive: true` accept input. Other commands get an empty stdin (`/dev/null`) like native pi, so commands that read stdin by mistake exit instead of hanging.
 - Diffs have size limits and may be unavailable for binary files or older history. File reports scan at most 20,000 entries or two seconds per snapshot and cannot reliably attribute concurrent external changes.
 - MCP SSE, audio, and binary embedded resources are unsupported. Image support depends on the model.
 - ACP v2 follows a draft schema. Client UI behavior, real provider sign-in, and Windows hardware still need verification.
