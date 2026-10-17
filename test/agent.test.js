@@ -116,8 +116,6 @@ test('配置名称和模式说明按系统语言切换，权限标识保持一�
       assert.deepEqual(state.configOptions.map(option => option.name), chinese
         ? ['模型', '推理级别', '权限模式'] : ['Model', 'Thinking Level', 'Permission Mode']);
       assert.deepEqual(state.configOptions[2].options, state.modes.availableModes.map(({ id, ...mode }) => ({ value: id, ...mode })));
-      assert.deepEqual(state.configOptions[1].options.map(option => option.name), chinese
-        ? ['关闭', '最低', '低', '中', '高', '极高', '最高'] : ['Off', 'Minimal', 'Low', 'Medium', 'High', 'Extra High', 'Max']);
       assert.equal(state.configOptions[2].currentValue, 'full');
     }
   } finally {

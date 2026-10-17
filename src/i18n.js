@@ -17,6 +17,9 @@ const zh = {
   sessionIndexNotNegotiated: '客户端未协商 sessionIndex',
   modelUnavailable: '模型不在可用列表中',
   thinkingUnsupported: '当前模型不支持此推理级别',
+  configModel: '模型',
+  configThinking: '推理级别',
+  configMode: '权限模式',
   configChanging: '配置正在切换，请稍后重试',
   subagent: '子 agent',
 
@@ -80,6 +83,14 @@ const zh = {
   loggedOutReconnect: '连接已登出，请完成终端认证后重新连接',
 
   // 会话
+  modePlan: '规划',
+  modePlanDescription: '只分析和制定计划，自动拒绝修改文件及执行命令',
+  modeReadOnly: '只读',
+  modeReadOnlyDescription: '自动拒绝写文件、执行命令及其他非内置只读工具',
+  modeStandard: '标准访问',
+  modeStandardDescription: '写文件、执行命令及其他非内置只读工具逐次请求授权',
+  modeFull: '完全访问',
+  modeFullDescription: '本会话自动允许全部工具调用，包括写文件和执行命令',
   unknownMode: '未知权限模式',
   unknownConfigOption: '未知配置选项',
   configDuringTurn: '执行期间不能切换模型或推理级别',
@@ -216,6 +227,9 @@ const en = {
   sessionIndexNotNegotiated: 'Client did not negotiate sessionIndex',
   modelUnavailable: 'Model is not in the available list',
   thinkingUnsupported: 'Current model does not support this thinking level',
+  configModel: 'Model',
+  configThinking: 'Thinking Level',
+  configMode: 'Permission Mode',
   configChanging: 'Configuration is changing; try again later',
   subagent: 'Subagent',
 
@@ -273,6 +287,14 @@ const en = {
   loggedOut: 'Logged out of this connection; complete terminal sign-in and reconnect',
   loggedOutReconnect: 'Connection is logged out; complete terminal authentication and reconnect',
 
+  modePlan: 'Plan',
+  modePlanDescription: 'Analyze and plan only; automatically deny file changes and command execution',
+  modeReadOnly: 'Read Only',
+  modeReadOnlyDescription: 'Automatically deny file writes, command execution, and tools other than built-in read-only tools',
+  modeStandard: 'Standard Access',
+  modeStandardDescription: 'Request approval for each file write, command execution, or tool other than built-in read-only tools',
+  modeFull: 'Full Access',
+  modeFullDescription: 'Automatically allow all tool calls in this session, including file writes and command execution',
   unknownMode: 'Unknown permission mode',
   unknownConfigOption: 'Unknown config option',
   configDuringTurn: 'Cannot change the model or thinking level while a prompt is running',
@@ -389,7 +411,7 @@ export const messages = { zh, en };
 
 let systemLocale;
 // 按 LC_ALL → LC_MESSAGES → LANG → 系统区域判断；每次读环境变量，测试可随时切换。
-export const isChinese = () => /^zh(?:[-_.@]|$)/i.test(process.env.LC_ALL || process.env.LC_MESSAGES ||
+const isChinese = () => /^zh(?:[-_.@]|$)/i.test(process.env.LC_ALL || process.env.LC_MESSAGES ||
   process.env.LANG || (systemLocale ??= Intl.DateTimeFormat().resolvedOptions().locale));
 
 // 用函数替换，避免变量值中的 $ 被当作替换模式。

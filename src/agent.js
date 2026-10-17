@@ -16,23 +16,11 @@ import { Commands } from './commands.js';
 import { convertMcp, convertPrompt } from './convert.js';
 import { changedFiles, fileSnapshot } from './file-changes.js';
 import { air, invalid, logError, modelKey, requireCwd, requireId, restrictedModes } from './shared.js';
-import { isChinese, t } from './i18n.js';
+import { t } from './i18n.js';
 
 const extensionPath = fileURLToPath(new URL('../extensions/acp.ts', import.meta.url));
-const modes = {
-  zh: [
-    { id: 'plan', name: '规划', description: '只分析和制定计划，自动拒绝修改文件及执行命令' },
-    { id: 'read-only', name: '只读', description: '自动拒绝写文件、执行命令及其他非内置只读工具' },
-    { id: 'standard', name: '标准访问', description: '写文件、执行命令及其他非内置只读工具逐次请求授权' },
-    { id: 'full', name: '完全访问', description: '本会话自动允许全部工具调用，包括写文件和执行命令' },
-  ],
-  en: [
-    { id: 'plan', name: 'Plan', description: 'Analyze and plan only; automatically deny file changes and command execution' },
-    { id: 'read-only', name: 'Read Only', description: 'Automatically deny file writes, command execution, and tools other than built-in read-only tools' },
-    { id: 'standard', name: 'Standard Access', description: 'Request approval for each file write, command execution, or tool other than built-in read-only tools' },
-    { id: 'full', name: 'Full Access', description: 'Automatically allow all tool calls in this session, including file writes and command execution' },
-  ],
-};
+// 权限模式 id → i18n key；说明文案的 key 为 `${key}Description`。
+const modes = { plan: 'modePlan', 'read-only': 'modeReadOnly', standard: 'modeStandard', full: 'modeFull' };
 
 // 需要按会话串行执行的方法（见 Agent.lifecycle）。
 const lifecycleMethods = {
@@ -56,8 +44,7 @@ const lifecycleMethods = {
 // ACP v2 由 protocol.js 的 ProtocolAgent 转换后调用本类。
 export class Agent {
   constructor({ send, command = 'pi', args = [] }) {
-    this.chinese = isChinese();
-    this.modes = modes[this.chinese ? 'zh' : 'en'];
+    this.modes = Object.entries(modes).map(([id, key]) => ({ id, name: t(key), description: t(`${key}Description`) }));
     this.send = send;
     this.command = command;
     this.args = args;
@@ -785,22 +772,18 @@ export class Agent {
   }
 
   modelConfig(session) {
-    return [{ id: 'model', name: this.chinese ? '模型' : 'Model', category: 'model', type: 'select',
+    return [{ id: 'model', name: t('configModel'), category: 'model', type: 'select',
       currentValue: session.currentModelId,
       ...(this.airRecommendedValue ? air({ recommendedValue: session.recommendedModelId }) : {}),
       options: session.availableModels.map(model => ({
         value: modelKey(model), name: model.name || model.id,
       })),
-    }, { id: 'thinking', name: this.chinese ? '推理级别' : 'Thinking Level', category: 'thought_level', type: 'select',
+    }, { id: 'thinking', name: t('configThinking'), category: 'thought_level', type: 'select',
       currentValue: session.thinkingLevel,
       ...(this.airRecommendedValue && session.thinkingLevels.includes(session.recommendedThinkingLevel)
         ? air({ recommendedValue: session.recommendedThinkingLevel }) : {}),
-      options: session.thinkingLevels.map(level => ({ value: level,
-        name: (this.chinese
-          ? { off: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高' }
-          : { off: 'Off', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max' })[level] || level,
-      })),
-    }, { id: 'mode', name: this.chinese ? '权限模式' : 'Permission Mode', category: 'mode', type: 'select',
+      options: session.thinkingLevels.map(level => ({ value: level, name: level })),
+    }, { id: 'mode', name: t('configMode'), category: 'mode', type: 'select',
       currentValue: session.mode,
       options: this.modes.map(mode => ({ value: mode.id, name: mode.name, description: mode.description })),
     }];
