@@ -3,6 +3,7 @@ import { Agent } from './agent.js';
 import { convertPrompt } from './convert.js';
 import { gitPatch } from './file-diff.js';
 import { invalid } from './shared.js';
+import { t } from './i18n.js';
 
 const options = values => values.map(({ id, ...option }) => ({ configId: id, ...option }));
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -56,16 +57,16 @@ export class ProtocolAgent {
     job.cancelled = true;
     if (!job.responded) {
       job.responded = true;
-      this.error(job.record.id, { code: -32800, message: '提示在插入前已取消' });
+      this.error(job.record.id, { code: -32800, message: t('promptCancelledBeforeInsert') });
     }
   }
 
   queuePrompt(record) {
     try {
       convertPrompt(record.params?.prompt);
-      if (!this.agent.initialized) throw invalid('请先 initialize');
-      if (!this.agent.sessions.has(record.params.sessionId)) throw invalid('会话不存在');
-      if (this.agent.closing) throw new Error('适配器正在关闭');
+      if (!this.agent.initialized) throw invalid(t('initializeFirst'));
+      if (!this.agent.sessions.has(record.params.sessionId)) throw invalid(t('sessionNotFound'));
+      if (this.agent.closing) throw new Error(t('adapterClosing'));
     } catch (error) { this.error(record.id, error); return; }
     const job = { record, sessionId: record.params.sessionId, buffer: [], responded: false,
       inserted: false, cancelled: false, started: false, messages: new Map(), tools: new Set() };
@@ -116,7 +117,7 @@ export class ProtocolAgent {
     }
     if (record.method === 'initialize') {
       if (!Number.isInteger(record.params?.protocolVersion) || record.params.protocolVersion < 0 || record.params.protocolVersion > 65535) {
-        if (record.id !== undefined) this.error(record.id, invalid('protocolVersion 必须是 0 到 65535 的整数'));
+        if (record.id !== undefined) this.error(record.id, invalid(t('protocolVersionRange')));
         return;
       }
       if (!this.agent.initialized) this.version = record.params.protocolVersion === 1 ? 1 : 2;
@@ -146,22 +147,22 @@ export class ProtocolAgent {
     if (typeof record.method !== 'string') return this.agent.receive(record);
     if (record.id === undefined && record.method !== 'session/cancel') return;
     if (record.params != null && !object(record.params)) {
-      if (record.id !== undefined) this.error(record.id, invalid('params 必须是对象'));
+      if (record.id !== undefined) this.error(record.id, invalid(t('paramsObject')));
       return;
     }
     if (['auth/login', 'auth/logout'].includes(record.method) && this.agent.initialized &&
         this.agent.clientCapabilities.auth?.terminal !== true) {
-      return this.error(record.id, { code: -32601, message: '客户端未协商终端认证' });
+      return this.error(record.id, { code: -32601, message: t('terminalAuthNotNegotiated') });
     }
     if (this.agent.loggedOut && !['initialize', 'auth/logout', 'auth/login'].includes(record.method)) {
-      if (record.id !== undefined) this.error(record.id, { code: -32000, message: '连接已登出，请完成终端认证后重新连接' });
+      if (record.id !== undefined) this.error(record.id, { code: -32000, message: t('loggedOutReconnect') });
       return;
     }
     if (record.method === 'auth/logout') for (const job of this.jobs.values()) this.cancel(job);
     if (record.method === 'session/prompt') return this.queuePrompt(record);
     if (['session/resume', 'session/close', 'session/delete', 'session/fork', 'session/cancel', 'session/set_config_option'].includes(record.method) &&
         (typeof record.params?.sessionId !== 'string' || !record.params.sessionId)) {
-      if (record.id !== undefined) this.error(record.id, invalid('缺少 sessionId'));
+      if (record.id !== undefined) this.error(record.id, invalid(t('missingSessionId')));
       return;
     }
     if (['session/cancel', 'session/close', 'session/delete'].includes(record.method)) {
@@ -169,14 +170,14 @@ export class ProtocolAgent {
     }
     const request = { ...record, params: record.params ?? {} };
     if (record.method === 'initialize') {
-      if (this.agent.initialized) return this.error(record.id, invalid('连接已经初始化'));
+      if (this.agent.initialized) return this.error(record.id, invalid(t('alreadyInitialized')));
       this.agent.protocolVersion = this.version;
       if (!object(request.params.info) || typeof request.params.info.name !== 'string' || typeof request.params.info.version !== 'string') {
-        return this.error(record.id, invalid('ACP v2 initialize 缺少 info.name 或 info.version'));
+        return this.error(record.id, invalid(t('v2InfoMissing')));
       }
       const capabilities = request.params.capabilities ?? {};
       if (!object(capabilities)) {
-        return this.error(record.id, invalid('capabilities 必须是对象'));
+        return this.error(record.id, invalid(t('capabilitiesObject')));
       }
       const elicitation = Object.fromEntries(['form', 'url'].filter(mode => object(capabilities.elicitation?.[mode]))
         .map(mode => [mode, capabilities.elicitation[mode]]));
@@ -186,12 +187,12 @@ export class ProtocolAgent {
     } else if (['session/new', 'session/resume', 'session/fork'].includes(record.method)) {
       if (request.params.additionalDirectories !== undefined &&
           (!Array.isArray(request.params.additionalDirectories) || request.params.additionalDirectories.length)) {
-        return this.error(record.id, invalid('未声明 additionalDirectories 能力，不支持额外工作目录'));
+        return this.error(record.id, invalid(t('additionalDirsUnsupported')));
       }
-      if (request.params.systemPrompt != null) return this.error(record.id, invalid('未声明 systemPrompt 能力'));
+      if (request.params.systemPrompt != null) return this.error(record.id, invalid(t('systemPromptUnsupported')));
       const servers = request.params.mcpServers ?? [];
       if (!Array.isArray(servers) || servers.some(server => !object(server))) {
-        return this.error(record.id, invalid('mcpServers 必须是对象数组'));
+        return this.error(record.id, invalid(t('mcpServersObjects')));
       }
       request.params = { ...request.params, mcpServers: servers.map(server => ({ ...server,
         ...(server.type === 'http' ? { headers: server.headers ?? [] } : { args: server.args ?? [], env: server.env ?? [] }) })) };
@@ -200,11 +201,11 @@ export class ProtocolAgent {
       const session = this.agent.sessions.get(request.params.sessionId);
       if (this.agent.lifecycleOperations.has(request.params.sessionId) || this.replays.has(request.params.sessionId) ||
           (session && this.agent.busy(session))) {
-        return this.error(record.id, invalid('会话正在使用，请稍后重试'));
+        return this.error(record.id, invalid(t('sessionBusy')));
       }
       if (request.params.replayFrom != null) {
         if (!object(request.params.replayFrom) || request.params.replayFrom.type !== 'start') {
-          return this.error(record.id, invalid('不支持此回放游标'));
+          return this.error(record.id, invalid(t('replayCursorUnsupported')));
         }
         request.method = 'session/load';
         this.replays.set(request.params.sessionId, new Set());
@@ -214,10 +215,10 @@ export class ProtocolAgent {
       request.params = { ...params, ...(cwd != null ? { cwd } : {}), ...(cursor != null ? { cursor } : {}) };
     } else if (record.method === 'session/set_config_option') {
       if (request.params.type !== 'id' || typeof request.params.value !== 'string') {
-        return this.error(record.id, invalid('配置选项需要 type: id 和字符串 value'));
+        return this.error(record.id, invalid(t('configOptionValue')));
       }
     } else if (['session/load', 'session/set_mode', 'session/set_model', '_session/steering'].includes(record.method)) {
-      return this.error(record.id, { code: -32601, message: `ACP v2 不支持此方法：${record.method}` });
+      return this.error(record.id, { code: -32601, message: t('v2MethodUnsupported', { method: record.method }) });
     }
     if (record.id !== undefined) this.requests.set(record.id, { method: record.method, sessionId: record.params?.sessionId,
       replaying: request.method === 'session/load' });
@@ -273,7 +274,7 @@ export class ProtocolAgent {
       }
       if (record.method === 'session/request_permission') {
         const { toolCall, ...params } = record.params;
-        this.send({ ...record, params: { ...params, title: toolCall.title || '工具授权',
+        this.send({ ...record, params: { ...params, title: toolCall.title || t('toolPermission'),
           subject: { type: 'tool_call', toolCall } } });
       } else this.send(record);
       return;
@@ -328,7 +329,7 @@ export class ProtocolAgent {
             operation: patch.kind === 'add' ? 'add' : 'modify' }], patch: { format: 'git_patch', text: patch.text } });
           seenDiff = true;
         } else content.push({ type: 'content', content: { type: 'text',
-          text: `${block.path}\n旧内容：\n${block.oldText ?? ''}\n新内容：\n${block.newText}` } });
+          text: t('diffText', { path: block.path, oldText: block.oldText ?? '', newText: block.newText }) } });
       }
       const { _meta, ...base } = update;
       update = { ...base, sessionUpdate: 'tool_call_update',

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { readJsonl, writeJsonl } from './jsonl.js';
+import { t } from './i18n.js';
 
 export class PiProcess {
   constructor({ command, args, cwd, configPath, onEvent, onFailure, onControl }) {
@@ -14,7 +15,7 @@ export class PiProcess {
     this.child.stdin.on('error', error => this.fail(error, onFailure));
     this.child.on('error', error => this.fail(error, onFailure));
     this.child.on('exit', (code, signal) => {
-      this.fail(new Error(`pi 已退出（${signal ?? code}）`), error => {
+      this.fail(new Error(t('piExited', { reason: signal ?? code })), error => {
         if (!this.closing) onFailure(error);
       });
     });
@@ -23,11 +24,11 @@ export class PiProcess {
       if (record.type === 'acp_task_request') void onControl?.(record);
       else this.response(record);
     },
-      error => this.fail(new Error(`ACP 控制通道无效：${error.message}`), onFailure));
+      error => this.fail(new Error(t('controlChannelInvalid', { error: error.message })), onFailure));
     readJsonl(this.child.stdout, record => {
       if (record.type === 'response') this.response(record);
       else onEvent(record);
-    }, error => this.fail(new Error(`pi 输出无效：${error.message}`), onFailure));
+    }, error => this.fail(new Error(t('piOutputInvalid', { error: error.message })), onFailure));
   }
 
   controlResponse(id, data, error) {
@@ -41,7 +42,7 @@ export class PiProcess {
     this.pending.delete(record.id);
     clearTimeout(request.timer);
     if (record.success) request.resolve(record.data);
-    else request.reject(new Error(record.error || 'pi 命令失败'));
+    else request.reject(new Error(record.error || t('piCommandFailed')));
   }
 
   fail(error, onFailure) {
@@ -57,7 +58,7 @@ export class PiProcess {
   }
 
   send(record) {
-    if (this.closed) throw new Error('pi 进程已关闭');
+    if (this.closed) throw new Error(t('piClosed'));
     writeJsonl(this.child.stdin, record);
   }
 
@@ -67,12 +68,12 @@ export class PiProcess {
       const timeout = type === 'compact' ? 300000 : 30000;
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`pi 命令超时：${type}`));
+        reject(new Error(t('piCommandTimeout', { type })));
       }, timeout);
       this.pending.set(id, { resolve, reject, timer });
       try {
         if (type === 'terminal_input' || type === 'acp_task_save') {
-          if (this.closed) throw new Error('pi 进程已关闭');
+          if (this.closed) throw new Error(t('piClosed'));
           writeJsonl(this.child.stdio[3], { ...params, type, id });
         } else this.send({ ...params, type, id });
       }

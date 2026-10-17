@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { TerminalProcesses, validateTerminalInput } from '../src/terminal-input.js';
+import { t as msg } from '../src/i18n.js';
 
 const shell = { shell: '/bin/bash', args: ['-c'] };
 const cwd = process.cwd();
@@ -23,7 +24,7 @@ test('stdin 支持分次 Unicode、显式换行、EOF 并清理退出进程', as
   assert.deepEqual(await run.completed, { exitCode: 0 });
   assert.equal(run.output(), '你好\n最后一行');
   assert.equal(terminals.processes.size, 0);
-  await assert.rejects(terminals.input({ terminalId: 'one', data: '迟到' }), /不存在/);
+  await assert.rejects(terminals.input({ terminalId: 'one', data: '迟到' }), { message: msg('terminalUnavailable') });
 });
 
 test('stdin 不串进程，拒绝非法输入与超过字节上限的 Unicode', async () => {
@@ -38,7 +39,7 @@ test('stdin 不串进程，拒绝非法输入与超过字节上限的 Unicode', 
   assert.equal(b.output(), 'B');
   for (const input of [{ terminalId: '', data: '' }, { terminalId: 'a', data: 1 },
     { terminalId: 'a', data: '你'.repeat(22000) }, { terminalId: 'a', data: '', eof: 1 }]) {
-    assert.throws(() => validateTerminalInput(input), /参数无效/);
+    assert.throws(() => validateTerminalInput(input), { message: msg('terminalInputInvalid') });
   }
 });
 

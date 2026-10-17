@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { invalid, readOnlyTools, restrictedModes } from './shared.js';
+import { t } from './i18n.js';
 
 // pi 扩展通过 notify 传回的控制消息。
 const notifyHandlers = {
@@ -100,7 +101,7 @@ export class Interactions {
     if (notices && typeof notices === 'object' && !Array.isArray(notices)) {
       this.agent.update(session, { sessionUpdate: 'notice',
         severity: event.notifyType === 'error' ? 'error' : event.notifyType === 'warning' ? 'warning' : 'info',
-        title: event.message || 'pi 通知' });
+        title: event.message || t('piNotification') });
     }
   }
 
@@ -113,7 +114,7 @@ export class Interactions {
         session.turn?.cancelled || session.command?.cancelled) {
       this.respond(session, event, { cancelled: true });
       if (session.turn) this.agent.update(session, { sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: `\n扩展交互暂不支持：${event.title ?? event.method}\n` } });
+        content: { type: 'text', text: `\n${t('extensionUiUnsupported', { name: event.title ?? event.method })}\n` } });
       return;
     }
     const property = event.method === 'confirm'
@@ -124,7 +125,7 @@ export class Interactions {
           ...(event.prefill !== undefined ? { default: event.prefill } : {}) };
     const result = await this.request(session, 'elicitation', 'elicitation/create', {
       sessionId: session.interactionSessionId ?? session.id, mode: 'form',
-      message: [event.title || 'pi 需要输入', event.message].filter(Boolean).join('\n\n'),
+      message: [event.title || t('piNeedsInput'), event.message].filter(Boolean).join('\n\n'),
       requestedSchema: { type: 'object', properties: { value: property }, required: ['value'] },
     });
     const value = result?.content?.value;
@@ -157,9 +158,9 @@ export class Interactions {
     const tool = session.tools.get(call.toolCallId) ?? this.agent.transcript.tool(session, call);
     const result = await this.request(session, 'permission', 'session/request_permission', {
       sessionId: session.interactionSessionId ?? session.id, toolCall: { ...tool, status: 'pending' }, options: [
-        { optionId: 'allow-once', name: '允许本次', kind: 'allow_once' },
-        { optionId: 'allow-session', name: '本会话允许全部工具', kind: 'allow_always' },
-        { optionId: 'reject-once', name: '拒绝本次', kind: 'reject_once' },
+        { optionId: 'allow-once', name: t('allowOnce'), kind: 'allow_once' },
+        { optionId: 'allow-session', name: t('allowSession'), kind: 'allow_always' },
+        { optionId: 'reject-once', name: t('rejectOnce'), kind: 'reject_once' },
       ] });
     const approved = !restrictedModes.includes(session.mode) && !session.turn?.cancelled &&
       result?.outcome?.outcome === 'selected' &&
@@ -183,14 +184,14 @@ export class Interactions {
       return { action: 'cancel' };
     }
     if (typeof params.message !== 'string' || !params.message.trim() || params.message.length > 10000 ||
-        typeof params.url !== 'string' || params.url.length > 10000) throw invalid('URL 交互参数无效');
+        typeof params.url !== 'string' || params.url.length > 10000) throw invalid(t('urlParamsInvalid'));
     let url;
-    try { url = new URL(params.url); } catch { throw invalid('URL 交互网址无效'); }
+    try { url = new URL(params.url); } catch { throw invalid(t('urlInvalid')); }
     if (url.username || url.password || (url.protocol !== 'https:' &&
         !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))) {
-      throw invalid('URL 交互仅允许 HTTPS 或本机 HTTP，且不能包含用户名或密码');
+      throw invalid(t('urlNotAllowed'));
     }
-    if (this.urlElicitations.size >= 100) throw invalid('待完成的 URL 交互过多');
+    if (this.urlElicitations.size >= 100) throw invalid(t('urlTooMany'));
     const elicitationId = randomUUID();
     const entry = { session, accepted: false };
     this.urlElicitations.set(elicitationId, entry);

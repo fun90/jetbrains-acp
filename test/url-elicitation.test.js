@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Agent } from '../src/agent.js';
 import { ProtocolAgent } from '../src/protocol.js';
+import { t as msg } from '../src/i18n.js';
 
 const params = { url: 'https://example.com/connect', message: '请授权账号' };
 function setup(version = 1) {
@@ -81,7 +82,7 @@ test('URL 校验拒绝危险协议、远程 HTTP、内嵌凭据及无效参数',
     await assert.rejects(agent.interactions.elicitUrl(session, { ...params, url }), /URL/);
   }
   for (const message of ['', null, 'x'.repeat(10001)]) {
-    await assert.rejects(agent.interactions.elicitUrl(session, { ...params, message }), /参数/);
+    await assert.rejects(agent.interactions.elicitUrl(session, { ...params, message }), { message: msg('urlParamsInvalid') });
   }
   assert.equal(records.length, 0);
   for (const url of ['http://localhost:8080/connect', 'http://127.0.0.1/connect', 'http://[::1]/connect']) {
@@ -109,7 +110,7 @@ test('取消清理待回复和已接受请求，忽略迟到回复与完成通�
 test('未完成 URL 请求有数量上限，发送异常也释放状态', async () => {
   const { agent, session } = setup();
   for (let index = 0; index < 100; index++) agent.interactions.urlElicitations.set(String(index), { session, accepted: true });
-  await assert.rejects(agent.interactions.elicitUrl(session, params), /过多/);
+  await assert.rejects(agent.interactions.elicitUrl(session, params), { message: msg('urlTooMany') });
   agent.interactions.cancel(session);
   agent.send = () => { throw new Error('连接已关闭'); };
   await assert.rejects(agent.interactions.elicitUrl(session, params), /连接已关闭/);

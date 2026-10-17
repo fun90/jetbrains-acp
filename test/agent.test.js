@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { readJsonl, writeJsonl } from '../src/jsonl.js';
 import { Agent } from '../src/agent.js';
+import { t as msg } from '../src/i18n.js';
 import { convertMcp, convertPrompt } from '../src/convert.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -133,26 +134,26 @@ test('终端输入校验会话、权限、取消状态及能力协商', async ()
   const agent = new Agent({ send: record => records.push(record) });
   await agent.dispatch('initialize', { protocolVersion: 1 });
   const params = { sessionId: 'a', terminalId: 'cmd', data: '你好\n' };
-  await assert.rejects(agent.dispatch('_terminal/input', params), /未启用/);
+  await assert.rejects(agent.dispatch('_terminal/input', params), { message: msg('terminalInputDisabled') });
   await agent.dispatch('initialize', { protocolVersion: 1, clientCapabilities: { _meta: { terminal_input: true } } });
   const session = { id: 'a', mode: 'full', turn: {}, inputTerminals: new Set(['cmd']),
     pi: { request: async (...args) => requests.push(args) } };
   agent.sessions.set('a', session);
-  await assert.rejects(agent.dispatch('_terminal/input', { ...params, sessionId: 'b' }), /不存在/);
-  await assert.rejects(agent.dispatch('_terminal/input', { ...params, terminalId: 'other' }), /不可输入/);
-  await assert.rejects(agent.dispatch('_terminal/input', { ...params, data: '你'.repeat(22000) }), /参数无效/);
+  await assert.rejects(agent.dispatch('_terminal/input', { ...params, sessionId: 'b' }), { message: msg('sessionNotFound') });
+  await assert.rejects(agent.dispatch('_terminal/input', { ...params, terminalId: 'other' }), { message: msg('terminalNotInput') });
+  await assert.rejects(agent.dispatch('_terminal/input', { ...params, data: '你'.repeat(22000) }), { message: msg('terminalInputInvalid') });
   for (const mode of ['plan', 'read-only']) {
     session.mode = mode;
-    await assert.rejects(agent.dispatch('_terminal/input', params), /不可输入/);
+    await assert.rejects(agent.dispatch('_terminal/input', params), { message: msg('terminalNotInput') });
   }
   session.mode = 'full';
   session.turn.cancelled = true;
-  await assert.rejects(agent.dispatch('_terminal/input', params), /不可输入/);
+  await assert.rejects(agent.dispatch('_terminal/input', params), { message: msg('terminalNotInput') });
   session.turn.cancelled = false;
   assert.deepEqual(await agent.dispatch('_terminal/input', { ...params, eof: true }), {});
   assert.deepEqual(requests, [['terminal_input', { terminalId: 'cmd', data: '你好\n', eof: true }]]);
   assert.deepEqual(records.at(-1).params.update._meta.terminal_input, { terminal_id: 'cmd', data: '你好\n' });
-  await assert.rejects(agent.dispatch('_terminal/input', params), /不可输入/);
+  await assert.rejects(agent.dispatch('_terminal/input', params), { message: msg('terminalNotInput') });
 });
 
 test('Air v1 聊天命令直接写入 stdin，保留空白并拒绝歧义与无权限输入', async () => {
@@ -171,18 +172,18 @@ test('Air v1 聊天命令直接写入 stdin，保留空白并拒绝歧义与无�
   assert.deepEqual(await send('/stdin', 'session/prompt'), { stopReason: 'end_turn' });
   assert.equal(requests[1][1].data, '\n');
   session.inputTerminals.add('other');
-  await assert.rejects(send('/stdin 不能串进程'), /恰好一个/);
+  await assert.rejects(send('/stdin 不能串进程'), { message: msg('needOneTerminal') });
   session.inputTerminals.delete('other');
   session.mode = 'read-only';
-  await assert.rejects(send('/stdin 拒绝'), /不可输入/);
+  await assert.rejects(send('/stdin 拒绝'), { message: msg('terminalNotInput') });
   session.mode = 'full';
   session.turn.cancelled = true;
-  await assert.rejects(send('/stdin 拒绝'), /不可输入/);
+  await assert.rejects(send('/stdin 拒绝'), { message: msg('terminalNotInput') });
   session.turn.cancelled = false;
-  await assert.rejects(send('/stdin ' + '你'.repeat(22000)), /参数无效/);
+  await assert.rejects(send('/stdin ' + '你'.repeat(22000)), { message: msg('terminalInputInvalid') });
   await send('/eof');
   assert.deepEqual(requests.at(-1), ['terminal_input', { terminalId: 'cmd', data: '', eof: true }]);
-  await assert.rejects(send('/stdin 已关闭'), /恰好一个/);
+  await assert.rejects(send('/stdin 已关闭'), { message: msg('needOneTerminal') });
   assert.equal(requests.length, 3);
   const v2 = new Agent({ send() {} });
   v2.protocolVersion = 2;
@@ -294,10 +295,10 @@ test('提示和 MCP 边界校验', () => {
   assert.deepEqual(convertPrompt([{ type: 'text', text: '查看' },
     { type: 'resource', resource: { uri: 'file:///a', text: '代码' } },
     { type: 'image', mimeType: 'image/png', data: 'abc' }]),
-  { message: '查看\n\n文件上下文（file:///a）：\n代码', images: [{ type: 'image', mimeType: 'image/png', data: 'abc' }] });
-  assert.throws(() => convertPrompt([{ type: 'audio' }]), /不支持/);
-  assert.throws(() => convertMcp([{ name: 'a', command: 'relative', args: [], env: [] }]), /绝对/);
-  assert.throws(() => convertMcp([{ name: 'a', type: 'sse' }]), /不支持/);
+  { message: `查看\n\n${msg('fileContext', { uri: 'file:///a', text: '代码' })}`, images: [{ type: 'image', mimeType: 'image/png', data: 'abc' }] });
+  assert.throws(() => convertPrompt([{ type: 'audio' }]), { message: msg('promptContentUnsupported', { type: 'audio' }) });
+  assert.throws(() => convertMcp([{ name: 'a', command: 'relative', args: [], env: [] }]), { message: msg('stdioMcpInvalid') });
+  assert.throws(() => convertMcp([{ name: 'a', type: 'sse' }]), { message: msg('mcpTransportUnsupported', { type: 'sse' }) });
 });
 
 test('初始化、错误、流式输出与真正完成时机', async t => {
@@ -598,8 +599,8 @@ test('steering 参数校验、失败响应与回合结束竞态', async () => {
   } } };
   agent.sessions.set(session.id, session);
   const params = { sessionId: session.id, prompt: [{ type: 'text', text: '继续' }] };
-  await assert.rejects(agent.dispatch('_session/steering', { ...params, prompt: [] }), /必须包含内容/);
-  await assert.rejects(agent.dispatch('_session/steering', { ...params, sessionId: 'missing' }), /会话不存在/);
+  await assert.rejects(agent.dispatch('_session/steering', { ...params, prompt: [] }), { message: msg('promptEmpty') });
+  await assert.rejects(agent.dispatch('_session/steering', { ...params, sessionId: 'missing' }), { message: msg('sessionNotFound') });
   let completed = false;
   const first = agent.dispatch('session/prompt', params).then(result => { completed = true; return result; });
   const steer = agent.dispatch('_session/steering', params);
@@ -618,7 +619,7 @@ test('steering 参数校验、失败响应与回合结束竞态', async () => {
   assert.equal(session.turn, null);
   assert.deepEqual(await agent.dispatch('_session/steering', params), { outcome: 'failed' });
   assert.equal(session.turn, null);
-  assert.match(updates.at(-1).params.update.content.text, /执行失败：提交失败/);
+  assert.ok(updates.at(-1).params.update.content.text.includes(msg('executionFailed', { error: '提交失败' })));
 });
 
 test('并发提示拒绝、取消和进程异常退出', async t => {
@@ -628,8 +629,8 @@ test('并发提示拒绝、取消和进程异常退出', async t => {
   assert.equal((await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'wait' }] })).error.code, -32602);
   c.send({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: sid } });
   assert.equal((await first).result.stopReason, 'cancelled');
-  assert.match((await c.request('session/prompt', { sessionId: sid,
-    prompt: [{ type: 'text', text: 'crash' }] })).error.message, /退出/);
+  assert.equal((await c.request('session/prompt', { sessionId: sid,
+    prompt: [{ type: 'text', text: 'crash' }] })).error.message, msg('piExited', { reason: 2 }));
 });
 
 test('同一会话的生命周期操作串行，避免重复打开', async () => {
@@ -759,7 +760,7 @@ test('命令发现、用量、状态、压缩、关闭和分叉', async t => {
     record.params.update.sessionUpdate === 'available_commands_update').params.update.availableCommands;
   assert.deepEqual(commands.map(command => command.name), ['status', 'compact', 'goal', 'fixture']);
   assert.deepEqual(commands.find(command => command.name === 'compact').input,
-    { type: 'unstructured', hint: '可选摘要要求' });
+    { type: 'unstructured', hint: msg('cmdCompactHint') });
   assert.ok(commands.filter(command => command.input).every(command => command.input.type === 'unstructured'));
   const initialUsage = c.records.find(record => record.params?.sessionId === sid &&
     record.params.update.sessionUpdate === 'usage_update').params.update;
@@ -767,8 +768,8 @@ test('命令发现、用量、状态、压缩、关闭和分叉', async t => {
     cost: { amount: 0.001, currency: 'USD' } });
   assert.equal((await c.request('session/prompt', { sessionId: sid,
     prompt: [{ type: 'text', text: '/status' }] })).result.stopReason, 'end_turn');
-  assert.match(c.records.findLast(record => record.params?.update?.sessionUpdate === 'agent_message_chunk')
-    .params.update.content.text, /上下文：123 \/ 1000/);
+  assert.ok(c.records.findLast(record => record.params?.update?.sessionUpdate === 'agent_message_chunk')
+    .params.update.content.text.endsWith(msg('statusContext', { tokens: 123, window: 1000, percent: ' (12.3%)' })));
   assert.equal((await c.request('session/prompt', { sessionId: sid,
     prompt: [{ type: 'text', text: '/compact 保留代码修改' }] })).result.stopReason, 'end_turn');
   const compactions = c.records.filter(record => record.params?.sessionId === sid &&
@@ -872,8 +873,9 @@ test('未协商压缩能力时仍可压缩但不发送草案事件', async t => 
   await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/compact' }] });
   assert.ok(!c.records.some(record => record.params?.sessionId === sid &&
     record.params.update.sessionUpdate === 'compaction_update'));
-  assert.match(c.records.findLast(record => record.params?.sessionId === sid &&
-    record.params.update.sessionUpdate === 'agent_message_chunk').params.update.content.text, /压缩完成/);
+  assert.equal(c.records.findLast(record => record.params?.sessionId === sid &&
+    record.params.update.sessionUpdate === 'agent_message_chunk').params.update.content.text,
+  msg('compactDone', { before: 500, after: 100 }));
 });
 
 test('扩展表单交互通过 elicitation 桥接，并保留无能力时的取消行为', async () => {
@@ -950,7 +952,7 @@ test('Air 文件修改报告仅在协商并请求后发送，且先于 prompt �
   assert.deepEqual(reportRecord.params.update._meta.jetbrains.air.agentFileChangeReport, {
     version: 1, requestId: 'turn-1', status: 'reported', paths: [root + 'a.txt'],
     declaredComplete: false, truncated: false,
-    uncertainty: '包含内置 edit/write 报告及工作目录前后快照的文件变化（含命令、MCP、扩展）；不扫描 .git 和符号链接目标。无法区分外部并发修改，可能遗漏修改后恢复、目录外及轮次结束后的后台修改。',
+    uncertainty: msg('fileReportUncertainty'),
   });
   assert.ok(c.records.indexOf(reportRecord) < c.records.indexOf(response));
   const failed = await c.request('session/prompt', { sessionId: sid,
@@ -1146,7 +1148,7 @@ test('ACP v2 提示确认、排队取消、状态更新和稳定消息回放', a
   const commands = c.records.find(record => record.params?.sessionId === sid &&
     record.params.update.sessionUpdate === 'available_commands_update').params.update.availableCommands;
   assert.deepEqual(commands.find(command => command.name === 'compact').input,
-    { type: 'text', hint: '可选摘要要求' });
+    { type: 'text', hint: msg('cmdCompactHint') });
   assert.ok(commands.filter(command => command.input).every(command => command.input.type === 'text'));
   const first = await c.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'wait' }] });
   assert.equal(typeof first.result.messageId, 'string');
@@ -1285,7 +1287,7 @@ test('ACP v2 后端崩溃保留提示确认并报告结构化错误', async t =>
   const failed = await c.wait(record => record.params?.sessionId === sid && record.params.update.state === 'idle' &&
     record.params.update.stopReason === 'error');
   assert.equal(failed.params.update.error.code, -32603);
-  assert.match(failed.params.update.error.message, /退出/);
+  assert.equal(failed.params.update.error.message, msg('piExited', { reason: 2 }));
   assert.equal(c.records.filter(record => record.id === accepted.id && !record.method).length, 1);
 });
 
@@ -1293,7 +1295,7 @@ test('拒绝用 --no-session 禁用 ACP 会话持久化', async t => {
   const c = await client(t, false, undefined, ['--no-session']);
   await c.request('initialize', { protocolVersion: 1 });
   const created = await c.request('session/new', { cwd: root, mcpServers: [] });
-  assert.match(created.error.message, /持久会话/);
+  assert.equal(created.error.message, msg('persistentSessionFailed'));
 });
 
 test('本机 pi 文件 diff、写入快照及跨进程回放（显式启用，使用本地模型替身）', { skip: !process.env.PI_ACP_SMOKE }, async t => {

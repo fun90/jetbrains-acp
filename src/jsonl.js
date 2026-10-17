@@ -1,3 +1,5 @@
+import { t } from './i18n.js';
+
 // 只按 LF 分帧，保留 JSON 字符串内合法的 Unicode 分隔符。
 export function readJsonl(stream, onRecord, onError) {
   let buffer = '';
@@ -13,7 +15,7 @@ export function readJsonl(stream, onRecord, onError) {
     }
   });
   stream.on('end', () => {
-    if (buffer.trim()) onError(new Error('JSONL 记录缺少换行结束符'));
+    if (buffer.trim()) onError(new Error(t('jsonlMissingNewline')));
   });
 }
 

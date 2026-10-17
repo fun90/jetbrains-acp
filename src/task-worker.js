@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { TerminalProcesses } from './terminal-input.js';
+import { t } from './i18n.js';
 
 const directory = process.argv[2];
 const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
@@ -33,7 +34,7 @@ const timer = setInterval(() => {
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
     flush();
   } catch (error) {
-    state.error = `后台任务存储失败：${error.message}`;
+    state.error = t('taskStoreFailed', { error: error.message });
     controller.abort();
   }
 }, 100);

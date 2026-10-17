@@ -1,23 +1,24 @@
 import { isAbsolute } from 'node:path';
 import { invalid } from './shared.js';
+import { t } from './i18n.js';
 
 // ACP 请求参数到 pi 配置与提示的转换，纯函数。
 export function convertMcp(servers) {
-  if (!Array.isArray(servers)) throw invalid('mcpServers 必须是数组');
+  if (!Array.isArray(servers)) throw invalid(t('mcpServersArray'));
   const result = Object.create(null);
   const names = new Set();
   for (const server of servers) {
     if (!server || typeof server.name !== 'string' || !/^[\w-]+$/.test(server.name)) {
-      throw invalid('MCP 名称只允许字母、数字、下划线和连字符');
+      throw invalid(t('mcpNameInvalid'));
     }
     const key = server.name.replaceAll('-', '_');
-    if (names.has(key)) throw invalid('MCP 名称重复');
+    if (names.has(key)) throw invalid(t('mcpNameDuplicate'));
     names.add(key);
     if (server.type === 'http') {
       if (typeof server.url !== 'string' || !/^https?:\/\//.test(server.url) ||
           !Array.isArray(server.headers) || server.headers.some(h =>
             !h || typeof h.name !== 'string' || typeof h.value !== 'string')) {
-        throw invalid('HTTP MCP 配置无效');
+        throw invalid(t('httpMcpInvalid'));
       }
       result[server.name] = { url: server.url,
         headers: Object.fromEntries(server.headers.map(h => [h.name, h.value])), exposure: 'direct' };
@@ -26,17 +27,17 @@ export function convertMcp(servers) {
           !Array.isArray(server.args) || server.args.some(a => typeof a !== 'string') ||
           !Array.isArray(server.env) || server.env.some(e =>
             !e || typeof e.name !== 'string' || typeof e.value !== 'string')) {
-        throw invalid('stdio MCP 需要绝对命令路径、args 和 env 数组');
+        throw invalid(t('stdioMcpInvalid'));
       }
       result[server.name] = { command: server.command, args: server.args,
         env: Object.fromEntries(server.env.map(e => [e.name, e.value])), exposure: 'direct' };
-    } else throw invalid(`不支持 MCP 传输：${server.type}`);
+    } else throw invalid(t('mcpTransportUnsupported', { type: server.type }));
   }
   return result;
 }
 
 export function convertPrompt(blocks) {
-  if (!Array.isArray(blocks) || !blocks.length) throw invalid('prompt 必须包含内容');
+  if (!Array.isArray(blocks) || !blocks.length) throw invalid(t('promptEmpty'));
   const text = [];
   const images = [];
   for (const block of blocks) {
@@ -45,10 +46,10 @@ export function convertPrompt(blocks) {
              typeof block.mimeType === 'string' && block.mimeType.startsWith('image/')) {
       images.push({ type: 'image', data: block.data, mimeType: block.mimeType });
     } else if (block?.type === 'resource' && typeof block.resource?.text === 'string') {
-      text.push(`文件上下文（${block.resource.uri}）：\n${block.resource.text}`);
+      text.push(t('fileContext', { uri: block.resource.uri, text: block.resource.text }));
     } else if (block?.type === 'resource_link' && typeof block.uri === 'string') {
-      text.push(`引用资源：${block.uri}`);
-    } else throw invalid(`不支持的提示内容：${block?.type}`);
+      text.push(t('resourceLink', { uri: block.uri }));
+    } else throw invalid(t('promptContentUnsupported', { type: block?.type }));
   }
   return { message: text.join('\n\n'), ...(images.length ? { images } : {}) };
 }

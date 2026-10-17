@@ -16,6 +16,7 @@ import { Commands } from './commands.js';
 import { convertMcp, convertPrompt } from './convert.js';
 import { changedFiles, fileSnapshot } from './file-changes.js';
 import { air, invalid, logError, modelKey, requireCwd, requireId, restrictedModes } from './shared.js';
+import { isChinese, t } from './i18n.js';
 
 const extensionPath = fileURLToPath(new URL('../extensions/acp.ts', import.meta.url));
 const modes = {
@@ -55,9 +56,7 @@ const lifecycleMethods = {
 // ACP v2 由 protocol.js 的 ProtocolAgent 转换后调用本类。
 export class Agent {
   constructor({ send, command = 'pi', args = [] }) {
-    const locale = process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG ||
-      Intl.DateTimeFormat().resolvedOptions().locale;
-    this.chinese = /^zh(?:[-_.@]|$)/i.test(locale);
+    this.chinese = isChinese();
     this.modes = modes[this.chinese ? 'zh' : 'en'];
     this.send = send;
     this.command = command;
@@ -101,7 +100,7 @@ export class Agent {
     if (!message || Array.isArray(message) || message.jsonrpc !== '2.0' ||
         (message.id !== undefined && message.id !== null &&
          typeof message.id !== 'string' && typeof message.id !== 'number')) {
-      this.send({ jsonrpc: '2.0', id: null, error: { code: -32600, message: '无效的 JSON-RPC 请求' } });
+      this.send({ jsonrpc: '2.0', id: null, error: { code: -32600, message: t('invalidJsonRpc') } });
       return;
     }
     if (!message.method && ('result' in message || 'error' in message)) {
@@ -110,7 +109,7 @@ export class Agent {
     }
     if (typeof message.method !== 'string') {
       this.send({ jsonrpc: '2.0', id: message.id ?? null,
-        error: { code: -32600, message: '缺少 method' } });
+        error: { code: -32600, message: t('missingMethod') } });
       return;
     }
     // ACP 的 cancel 是通知；其他操作需要请求 ID。
@@ -121,12 +120,12 @@ export class Agent {
     } catch (error) {
       if (message.id !== undefined) this.send({ jsonrpc: '2.0', id: message.id,
         error: { code: error.code ?? -32603, message: error.message } });
-      else process.stderr.write(`通知处理失败：${error.message}\n`);
+      else logError('notificationFailed')(error);
     }
   }
 
   initialize(params) {
-    if (!Number.isInteger(params.protocolVersion)) throw invalid('缺少 protocolVersion');
+    if (!Number.isInteger(params.protocolVersion)) throw invalid(t('missingProtocolVersion'));
     this.clientCapabilities = params.clientCapabilities ?? {};
     const airInfo = this.clientCapabilities?._meta?.jetbrains?.air;
     const airCapabilities = airInfo?.version >= 1 && Array.isArray(airInfo.capabilities) ? airInfo.capabilities : [];
@@ -151,8 +150,8 @@ export class Agent {
       },
         promptCapabilities: { image: true, embeddedContext: true },
         mcpCapabilities: { http: true, sse: false } }, authMethods: this.terminalAuth
-        ? [{ id: 'pi-login', name: '登录 pi 模型提供商',
-          description: '在终端 pi 中输入 /login，完成登录后退出并返回 IDE', type: 'terminal',
+        ? [{ id: 'pi-login', name: t('loginMethodName'),
+          description: t('loginMethodDescription'), type: 'terminal',
           env: { PI_ACP_SETUP: '1' },
           _meta: { 'terminal-auth': { args: ['--setup', '--pi-command', this.command, '--', ...this.args] } } }]
         : [],
@@ -167,11 +166,11 @@ export class Agent {
   }
 
   async dispatch(method, params) {
-    if (!params || typeof params !== 'object' || Array.isArray(params)) throw invalid('params 必须是对象');
+    if (!params || typeof params !== 'object' || Array.isArray(params)) throw invalid(t('paramsObject'));
     if (method === 'initialize') return this.initialize(params);
-    if (!this.initialized) throw invalid('请先 initialize');
+    if (!this.initialized) throw invalid(t('initializeFirst'));
     if ((method === 'authenticate' || method === 'auth/login') && this.terminalAuth) {
-      throw invalid('终端认证不能通过 ACP 请求执行，请启动终端登录入口后重新连接');
+      throw invalid(t('terminalAuthViaAcp'));
     }
     if (method === 'auth/logout' && this.protocolVersion === 2 && this.clientCapabilities.auth?.terminal === true) {
       this.loggedOut = true;
@@ -181,11 +180,11 @@ export class Agent {
       await this.close();
       return {};
     }
-    if (this.loggedOut) throw Object.assign(new Error('已退出当前连接，请完成终端登录后重新连接'), { code: -32000 });
-    if (this.closing) throw new Error('适配器正在关闭');
+    if (this.loggedOut) throw Object.assign(new Error(t('loggedOut')), { code: -32000 });
+    if (this.closing) throw new Error(t('adapterClosing'));
     if (['_session/async_task/list', '_session/async_task/stop'].includes(method)) {
       const session = this.sessions.get(params.sessionId);
-      if (!session) throw invalid('会话不存在');
+      if (!session) throw invalid(t('sessionNotFound'));
       if (method.endsWith('/stop')) return this.tasks.stop(session, params.asyncTaskId);
       return { tasks: this.tasks.ownedBy(session.id)
         .map(task => this.tasks.snapshot(task)) };
@@ -200,38 +199,38 @@ export class Agent {
       return this.lifecycle(params.sessionId, () => lifecycleMethods[method](this, params));
     }
     if (method === '_session/archive' || method === '_session/unarchive') {
-      if (!this.airIndex) throw invalid('客户端未协商 sessionIndex');
+      if (!this.airIndex) throw invalid(t('sessionIndexNotNegotiated'));
       return this.lifecycle(params.sessionId, () => this.index.archive(params, method === '_session/archive'));
     }
     if (method === '_session/list/subscribe') return this.index.subscribe(params);
     if (method === '_session/list/unsubscribe') return this.index.unsubscribe(params);
     if (!['session/prompt', '_session/steering', 'session/cancel', 'session/set_model', 'session/set_config_option', 'session/set_mode'].includes(method)) {
-      throw Object.assign(new Error(`不支持的方法：${method}`), { code: -32601 });
+      throw Object.assign(new Error(t('methodUnsupported', { method })), { code: -32601 });
     }
     const session = this.sessions.get(params.sessionId);
     if (!session) {
       const task = this.tasks.relation(params.sessionId);
       if (method === 'session/cancel' && task && task.state !== 'running') return {};
-      throw invalid('会话不存在');
+      throw invalid(t('sessionNotFound'));
     }
     if (session.failure) throw session.failure;
     if (this.lifecycleOperations.has(params.sessionId) && method !== 'session/cancel') {
-      throw invalid('会话正在操作，请稍后重试');
+      throw invalid(t('sessionOperating'));
     }
     if (method === 'session/set_mode' || (method === 'session/set_config_option' && params.configId === 'mode')) {
       const modeId = method === 'session/set_mode' ? params.modeId : params.value;
-      if (!this.modes.some(mode => mode.id === modeId)) throw invalid('未知权限模式');
+      if (!this.modes.some(mode => mode.id === modeId)) throw invalid(t('unknownMode'));
       await this.setMode(session, modeId);
       return method === 'session/set_mode' ? {} : { configOptions: this.modelConfig(session) };
     }
     if (method === 'session/set_model' || method === 'session/set_config_option') {
       const configId = method === 'session/set_model' ? 'model' : params.configId;
       const value = method === 'session/set_model' ? params.modelId : params.value;
-      if (!['model', 'thinking'].includes(configId)) throw invalid('未知配置选项');
-      if (session.turn) throw invalid('执行期间不能切换模型或推理级别');
-      if (configId === 'model' && !session.availableModels.some(model => modelKey(model) === value)) throw invalid('模型不在可用列表中');
-      if (configId === 'thinking' && !session.thinkingLevels.includes(value)) throw invalid('当前模型不支持此推理级别');
-      if (session.changingConfig) throw invalid('配置正在切换，请稍后重试');
+      if (!['model', 'thinking'].includes(configId)) throw invalid(t('unknownConfigOption'));
+      if (session.turn) throw invalid(t('configDuringTurn'));
+      if (configId === 'model' && !session.availableModels.some(model => modelKey(model) === value)) throw invalid(t('modelUnavailable'));
+      if (configId === 'thinking' && !session.thinkingLevels.includes(value)) throw invalid(t('thinkingUnsupported'));
+      if (session.changingConfig) throw invalid(t('configChanging'));
       session.changingConfig = true;
       try {
         await this.applyModelConfig(session, configId === 'model' ? value : undefined,
@@ -253,10 +252,10 @@ export class Agent {
     if (this.terminalChatInput && await this.commands.terminalChat(session, convertPrompt(params.prompt))) {
       return steering ? { outcome: 'injected' } : { stopReason: 'end_turn' };
     }
-    if (session.turn && !steering) throw invalid('该会话已有正在执行的提示');
-    if (session.turn?.cancelled) throw invalid('会话正在取消，请稍后重试');
-    if (session.turn?.finishing) throw invalid('会话正在生成文件报告，请稍后重试');
-    if (session.changingConfig) throw invalid('配置正在切换，请稍后重试');
+    if (session.turn && !steering) throw invalid(t('promptRunning'));
+    if (session.turn?.cancelled) throw invalid(t('sessionCancelling'));
+    if (session.turn?.finishing) throw invalid(t('sessionReporting'));
+    if (session.changingConfig) throw invalid(t('configChanging'));
     const prompt = convertPrompt(params.prompt);
     if (!steering && !prompt.images && this.commands.isLocal(prompt.message.trim())) {
       return this.commands.run(session, prompt.message.trim(), this.fileReportRequest(params));
@@ -265,12 +264,12 @@ export class Agent {
   }
 
   async terminalInput(params) {
-    if (!this.terminalInputEnabled) throw invalid('客户端未启用 _meta.terminal_input');
+    if (!this.terminalInputEnabled) throw invalid(t('terminalInputDisabled'));
     try { validateTerminalInput(params); } catch (error) { throw invalid(error.message); }
     const session = this.requireSession(params.sessionId);
     if (!session.turn || session.turn.cancelled || session.changingConfig ||
         this.lifecycleOperations.has(session.id) || restrictedModes.includes(session.mode) ||
-        !session.inputTerminals?.has(params.terminalId)) throw invalid('终端当前不可输入');
+        !session.inputTerminals?.has(params.terminalId)) throw invalid(t('terminalNotInput'));
     await session.pi.request('terminal_input', { terminalId: params.terminalId, data: params.data, eof: params.eof });
     if (params.eof) session.inputTerminals.delete(params.terminalId);
     this.update(session, { sessionUpdate: 'tool_call_update', toolCallId: params.terminalId,
@@ -286,7 +285,7 @@ export class Agent {
 
   requireSession(sessionId) {
     const session = this.sessions.get(sessionId);
-    if (!session) throw invalid('会话不存在');
+    if (!session) throw invalid(t('sessionNotFound'));
     if (session.failure) throw session.failure;
     return session;
   }
@@ -297,18 +296,18 @@ export class Agent {
 
   async goalSession(params) {
     const session = this.requireSession(params.sessionId);
-    if (session.changingConfig) throw invalid('会话正在操作，请稍后重试');
-    if (!['set', 'pause', 'resume', 'clear'].includes(params.action)) throw invalid('未知 goal 操作');
+    if (session.changingConfig) throw invalid(t('sessionOperating'));
+    if (!['set', 'pause', 'resume', 'clear'].includes(params.action)) throw invalid(t('unknownGoalAction'));
     const now = Date.now();
     let goal;
     if (params.action === 'set') {
       if (typeof params.objective !== 'string' || !params.objective.trim() || params.objective.length > 10000) {
-        throw invalid('goal objective 无效');
+        throw invalid(t('goalObjectiveInvalid'));
       }
       goal = { objective: params.objective.trim(), status: 'active', createdAt: now, updatedAt: now };
     } else if (params.action === 'clear') goal = null;
     else {
-      if (!session.goal) throw invalid('当前没有 goal');
+      if (!session.goal) throw invalid(t('noGoalSet'));
       goal = { ...session.goal, status: params.action === 'pause' ? 'paused' : 'active', updatedAt: now };
     }
     await session.pi.request('prompt', { message: `/__acp_goal ${JSON.stringify(goal)}` });
@@ -340,8 +339,7 @@ export class Agent {
           ? { version: 1, requestId: turn.fileReportRequest, status: 'unavailable', reason: 'notReported' }
           : { version: 1, requestId: turn.fileReportRequest, status: 'reported',
             paths, declaredComplete: false, truncated,
-            uncertainty: '包含内置 edit/write 报告及工作目录前后快照的文件变化（含命令、MCP、扩展）；不扫描 .git 和符号链接目标。无法区分外部并发修改，可能遗漏修改后恢复、目录外及轮次结束后的后台修改。' +
-              (turn.filesIncomplete ? ' 快照扫描未完成（读取失败或超过 20000 项／2 秒限制），新增和删除可能漏报。' : '') };
+            uncertainty: t('fileReportUncertainty') + (turn.filesIncomplete ? t('fileReportIncomplete') : '') };
     while (report.status === 'reported' && Buffer.byteLength(JSON.stringify(report)) > 256 * 1024 && report.paths.length) {
       report.paths.pop();
       report = { ...report, truncated: true };
@@ -366,7 +364,7 @@ export class Agent {
           session.turn = null;
           if (steering && turn.error && !turn.cancelled) {
             this.update(session, { sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `\n执行失败：${turn.error.message}\n` } });
+              content: { type: 'text', text: `\n${t('executionFailed', { error: turn.error.message })}\n` } });
           }
           resolve();
         };
@@ -389,7 +387,7 @@ export class Agent {
         turn.taskWrite = this.tasks.save(this.sessions.get(task.owner), task);
         task.completion = turn.completed.then(() => this.tasks.finish(task,
           turn.cancelled ? 'stopped' : turn.error ? 'failed' : 'completed', turn.error));
-        task.completion.catch(error => process.stderr.write(`保存子任务失败：${error.message}\n`));
+        task.completion.catch(error => logError('saveTaskFailed')(error));
       }
     }
     const turn = session.turn;
@@ -398,7 +396,7 @@ export class Agent {
     const submission = (turn.submission ?? Promise.resolve()).catch(() => {}).then(async () => {
       await turn.taskWrite;
       await turn.filesBefore;
-      if (turn.cancelled) throw invalid('会话正在取消，请稍后重试');
+      if (turn.cancelled) throw invalid(t('sessionCancelling'));
       const starts = turn.starts;
       const accepted = await session.pi.request('prompt', {
         ...prompt, ...(steering ? { streamingBehavior: 'steer' } : {}),
@@ -452,7 +450,7 @@ export class Agent {
     const lower = message.toLowerCase();
     const category = /rate.?limit|quota|context.?window|token limit/.test(lower) ? 'limit'
       : /connect|network|econn|timeout|exited|退出/.test(lower) ? 'connection'
-        : /bad request|invalid|不支持|无效/.test(lower) ? 'request' : 'service';
+        : /bad request|invalid|unsupported|不支持|无效/.test(lower) ? 'request' : 'service';
     return { id: `${session.id}:error:${++this.sequence}`, revision: 1, category,
       severity: 'error', title: message.slice(0, 240),
       ...(message.length > 240 ? { details: message } : {}), actions: ['retry'] };
@@ -469,14 +467,14 @@ export class Agent {
     convertMcp(params.mcpServers);
     const existing = this.sessions.get(params.sessionId);
     if (existing) {
-      if (this.busy(existing) || !existing.availableModels) throw invalid('会话正在使用，请稍后重试');
-      if (resolve(existing.cwd) !== resolve(params.cwd)) throw invalid('会话工作目录不匹配');
+      if (this.busy(existing) || !existing.availableModels) throw invalid(t('sessionBusy'));
+      if (resolve(existing.cwd) !== resolve(params.cwd)) throw invalid(t('sessionCwdMismatch'));
       if (existing.failure) throw existing.failure;
       return this.updateSessionMcp(existing, params);
     }
     const saved = await this.index.find(params.sessionId, params.cwd);
-    if (this.sessions.has(params.sessionId)) throw invalid('会话正在加载，请稍后重试');
-    if (!saved) throw invalid('当前目录中没有此历史会话');
+    if (this.sessions.has(params.sessionId)) throw invalid(t('sessionLoading'));
+    if (!saved) throw invalid(t('savedSessionNotInCwd'));
     await this.newSession(params, { ...metadata, id: saved.sessionId, path: saved.path });
     return this.sessions.get(params.sessionId);
   }
@@ -497,13 +495,13 @@ export class Agent {
         await session.pi.request('set_model', { provider: model.provider, modelId: model.id });
         session.currentModelId = modelId;
         await this.refreshThinking(session);
-      } else if (strict) throw invalid('模型不在可用列表中');
+      } else if (strict) throw invalid(t('modelUnavailable'));
     }
     if (thinkingLevel !== undefined && thinkingLevel !== session.thinkingLevel) {
       if (session.thinkingLevels.includes(thinkingLevel)) {
         await session.pi.request('set_thinking_level', { level: thinkingLevel });
         await this.refreshThinking(session);
-      } else if (strict) throw invalid('当前模型不支持此推理级别');
+      } else if (strict) throw invalid(t('thinkingUnsupported'));
     }
   }
 
@@ -516,14 +514,14 @@ export class Agent {
   async updateSessionMcp(existing, params) {
     if (isDeepStrictEqual(convertMcp(params.mcpServers ?? []), convertMcp(existing.mcpServers))) return existing;
     if (this.tasks.ownedBy(existing.id).some(task => task.state === 'running')) {
-      throw invalid('后台任务正在运行，请结束任务后再更新 MCP 配置');
+      throw invalid(t('tasksRunningMcp'));
     }
     existing.changingConfig = true;
     let replacement;
     try {
       await existing.taskWrites;
       const state = await existing.pi.request('get_state');
-      if (!state.sessionFile) throw new Error('原会话未持久保存');
+      if (!state.sessionFile) throw new Error(t('sessionNotPersisted'));
       await this.newSession(params, { id: existing.id, path: state.sessionFile,
         parentId: existing.parentId, taskId: existing.taskId, mode: existing.mode,
         instructions: existing.customInstructions, keepBusy: true });
@@ -550,7 +548,7 @@ export class Agent {
     const requestedCwd = params.cwd ?? live?.cwd;
     if (requestedCwd !== undefined) requireCwd(requestedCwd);
     const saved = await this.index.find(params.sessionId, requestedCwd);
-    if (!saved) throw invalid('没有此历史会话');
+    if (!saved) throw invalid(t('savedSessionNotFound'));
     const cwd = requestedCwd ?? saved.cwd;
     let header;
     let historyText;
@@ -558,9 +556,9 @@ export class Agent {
       historyText = await readFile(saved.path, 'utf8');
       header = JSON.parse(historyText.split('\n', 1)[0]);
     }
-    catch { throw invalid('历史会话文件无效，未执行删除'); }
+    catch { throw invalid(t('sessionFileInvalid')); }
     if (header?.id !== params.sessionId || resolve(header.cwd) !== resolve(cwd)) {
-      throw invalid('历史会话文件身份不匹配，未执行删除');
+      throw invalid(t('sessionFileMismatch'));
     }
     const hasTasks = historyText.split('\n').some(line => {
       try { const entry = JSON.parse(line); return entry.customType === 'acp_task' && entry.data?.owner === params.sessionId; }
@@ -576,15 +574,15 @@ export class Agent {
 
   async renameSession(params) {
     requireId(params.sessionId);
-    if (typeof params.title !== 'string' || !params.title.trim()) throw invalid('标题不能为空');
+    if (typeof params.title !== 'string' || !params.title.trim()) throw invalid(t('titleEmpty'));
     const session = this.sessions.get(params.sessionId);
     if (session) {
-      if (this.busy(session)) throw invalid('会话正在使用，请稍后重试');
+      if (this.busy(session)) throw invalid(t('sessionBusy'));
       await session.pi.request('set_session_name', { name: params.title.trim() });
       return {};
     }
     const saved = await this.index.find(params.sessionId);
-    if (!saved) throw invalid('没有此历史会话');
+    if (!saved) throw invalid(t('savedSessionNotFound'));
     const opened = await this.newSession({ cwd: saved.cwd, mcpServers: [] }, { id: saved.sessionId, path: saved.path });
     try { await this.sessions.get(opened.sessionId).pi.request('set_session_name', { name: params.title.trim() }); }
     finally { await this.closeSession({ sessionId: opened.sessionId }); }
@@ -640,8 +638,8 @@ export class Agent {
   // 会话就绪后发布可用命令与用量；失败只记录日志。
   async publishSession(session) {
     await Promise.all([
-      this.commands.publish(session).catch(logError('发布命令失败')),
-      this.refreshUsage(session).catch(logError('刷新用量失败')),
+      this.commands.publish(session).catch(logError('publishCommandsFailed')),
+      this.refreshUsage(session).catch(logError('refreshUsageFailed')),
     ]);
   }
 
@@ -669,12 +667,12 @@ export class Agent {
 
   async newSession(params, { id = randomUUID(), path, discovery = false, parentId, taskId, mode, instructions, keepBusy = false } = {}) {
     requireCwd(params.cwd);
-    if (!(await stat(params.cwd)).isDirectory()) throw invalid('cwd 必须是目录');
+    if (!(await stat(params.cwd)).isDirectory()) throw invalid(t('cwdDirectory'));
     const mcpServers = convertMcp(params.mcpServers ?? []);
     const customInstructions = instructions ?? (this.airCustomInstructions
       ? params._meta?.jetbrains?.air?.customInstructions : undefined);
     if (customInstructions !== undefined && (typeof customInstructions !== 'string' || customInstructions.length > 100000)) {
-      throw invalid('自定义指令无效');
+      throw invalid(t('customInstructionsInvalid'));
     }
     const relation = this.tasks.relation(id);
     parentId ??= relation?.owner;
@@ -693,7 +691,7 @@ export class Agent {
       await writeFile(configPath, JSON.stringify({ mcpServers, terminalInput: this.terminalInputEnabled === true,
         ...(customInstructions ? { customInstructions } : {}),
         sessionDir: sessionDirIndex === -1 ? undefined : this.args[sessionDirIndex + 1] }), { mode: 0o600 });
-      if (this.closing) throw new Error('适配器正在关闭');
+      if (this.closing) throw new Error(t('adapterClosing'));
       session.pi = new PiProcess({ command: this.command,
         args: [...this.args, '--mode', 'rpc', ...(discovery ? ['--no-session'] : path ? ['--session', path] : ['--session-id', id]), '--extension', extensionPath],
         cwd: params.cwd, configPath,
@@ -701,17 +699,17 @@ export class Agent {
         onControl: request => this.control(session, request),
         onFailure: error => {
           session.failure = error;
-          void this.tasks.close(session, error).catch(logError('关闭后台任务失败'));
+          void this.tasks.close(session, error).catch(logError('closeTasksFailed'));
           if (session.turn) { session.turn.error = error; session.turn.settle(); }
           this.interactions.cancel(session);
         } });
       const state = await session.pi.request('get_state');
       session.file = state.sessionFile;
       await session.pi.request('prompt', { message: '/__acp_check' });
-      if (!session.ready) throw new Error('ACP 扩展未就绪，请使用 pi 1.1.0 或兼容版本');
+      if (!session.ready) throw new Error(t('extensionNotReady'));
       if (session.failure) throw session.failure;
       if (discovery) return session;
-      if (state.sessionId !== id || !state.sessionFile) throw new Error('pi 未创建正确的持久会话，请移除会话选择或 --no-session 启动参数');
+      if (state.sessionId !== id || !state.sessionFile) throw new Error(t('persistentSessionFailed'));
       const available = await session.pi.request('get_available_models');
       session.availableModels = available?.models ?? [];
       if (state?.model && !session.availableModels.some(model =>
@@ -719,7 +717,7 @@ export class Agent {
         session.availableModels.push(state.model);
       }
       const current = state?.model ?? session.availableModels[0];
-      if (!current) throw new Error('pi 没有可用模型，请先在终端运行 pi 配置模型提供商及登录信息');
+      if (!current) throw new Error(t('noModels'));
       if (!state?.model) await session.pi.request('set_model', { provider: current.provider, modelId: current.id });
       session.currentModelId = modelKey(current);
       session.recommendedModelId = session.currentModelId;
@@ -749,7 +747,7 @@ export class Agent {
   }
 
   async setMode(session, modeId, publish = true) {
-    if (session.changingConfig) throw invalid('会话正在操作，请稍后重试');
+    if (session.changingConfig) throw invalid(t('sessionOperating'));
     const originalMode = session.mode;
     session.changingConfig = true;
     try {
@@ -828,18 +826,18 @@ export class Agent {
       this.recordUsage(session, event.result?.usage);
       this.transcript.compactionUpdate(session, session.compactionId ?? `pi-compaction-${randomUUID()}`,
         event.result ? 'completed' : event.aborted ? 'cancelled' : 'failed', event.result, event.errorMessage);
-      void this.refreshUsage(session).catch(logError('刷新用量失败'));
+      void this.refreshUsage(session).catch(logError('refreshUsageFailed'));
       return;
     }
     if (event.type === 'extension_ui_request') {
       void this.interactions.handle(session, event).catch(error => {
-        process.stderr.write(`扩展交互失败：${error.message}\n`);
+        logError('extensionUiFailed')(error);
         if (!session.pi.closed) session.pi.send({ type: 'extension_ui_response', id: event.id, cancelled: true });
       });
       return;
     }
     if (event.type === 'extension_error' && event.extensionPath === extensionPath) {
-      const error = new Error(`ACP 扩展失败：${event.error}`);
+      const error = new Error(t('extensionFailed', { error: event.error }));
       session.failure = error;
       session.pi.fail(error, () => {
         if (session.turn) { session.turn.error = error; session.turn.settle(); }
@@ -881,7 +879,7 @@ export class Agent {
               content: { type: 'text', text: text.slice(streamed.length) } });
           }
         }
-        if (message.stopReason === 'error') session.turn.error = new Error(message.errorMessage || '模型执行失败');
+        if (message.stopReason === 'error') session.turn.error = new Error(message.errorMessage || t('modelFailed'));
         if (message.stopReason === 'length') session.turn.stopReason = 'max_tokens';
         if (message.stopReason === 'aborted') session.turn.cancelled = true;
         break;
@@ -894,11 +892,11 @@ export class Agent {
         this.transcript.toolUpdated(session, event);
         break;
       case 'auto_retry_end':
-        if (!event.success) session.turn.error = new Error(event.finalError || '模型重试失败');
+        if (!event.success) session.turn.error = new Error(event.finalError || t('retryFailed'));
         break;
       case 'agent_settled':
         if (event.aborted) session.turn.cancelled = true;
-        session.turn.usage = this.refreshUsage(session).catch(logError('刷新用量失败'));
+        session.turn.usage = this.refreshUsage(session).catch(logError('refreshUsageFailed'));
         session.turn.settle();
         break;
     }
@@ -913,15 +911,15 @@ export class Agent {
         session.pi.controlResponse(request.id, result);
         return;
       }
-      if (!session.turn || session.turn.cancelled) throw invalid('会话没有可执行工具的回合');
+      if (!session.turn || session.turn.cancelled) throw invalid(t('noToolTurn'));
       let result;
       if (request.action === 'spawn_agent' || request.action === 'background_shell') {
-        if (!session.authorizedTasks?.delete(request.toolCallId)) throw invalid('任务工具尚未授权');
+        if (!session.authorizedTasks?.delete(request.toolCallId)) throw invalid(t('taskToolUnauthorized'));
         result = await this.tasks.start(session, request.action === 'spawn_agent' ? 'agent' : 'shell',
           request.params ?? {}, request.toolCallId);
       } else if (request.action === 'task_status') result = this.tasks.snapshot(this.tasks.owned(session, request.params?.taskId));
       else if (request.action === 'stop_task') result = await this.tasks.stop(session, request.params?.taskId);
-      else throw invalid('未知任务操作');
+      else throw invalid(t('unknownTaskAction'));
       session.pi.controlResponse(request.id, result);
     } catch (error) { session.pi.controlResponse(request.id, undefined, error); }
   }

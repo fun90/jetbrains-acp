@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Agent } from '../src/agent.js';
 import { changedFiles, fileSnapshot } from '../src/file-changes.js';
+import { t as msg } from '../src/i18n.js';
 
 test('工作目录快照覆盖新增、同大小修改、删除、重命名、二进制和忽略文件', async t => {
   const cwd = await mkdtemp(join(tmpdir(), 'pi-acp-changes-'));
@@ -71,7 +72,7 @@ test('快照失败不阻止执行，报告明确标注截断与不确定性', as
   const report = records.at(-1).params.update._meta.jetbrains.air.agentFileChangeReport;
   assert.equal(report.status, 'reported');
   assert.equal(report.truncated, true);
-  assert.match(report.uncertainty, /快照扫描未完成/);
+  assert.ok(report.uncertainty.endsWith(msg('fileReportIncomplete')));
 });
 
 test('文件报告覆盖命令、MCP、失败工具副作用及扩展命令，并隔离下一轮', async t => {

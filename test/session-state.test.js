@@ -4,6 +4,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Agent } from '../src/agent.js';
+import { t as msg } from '../src/i18n.js';
 
 function session(id, pi) {
   return { id, pi, cwd: tmpdir(), mode: 'standard', changingConfig: false,
@@ -81,7 +82,7 @@ test('无效分叉点参数不打开或修改源会话', async () => {
     { version: 1, messageId: ' ' }, { version: 1, messageId: 'old', messageFingerprint: 'bad' },
     { version: 1, messageId: 'old', messageOccurrence: 0 }]) {
     await assert.rejects(agent.forks.fork({ sessionId: 'source', _meta: { jetbrains: { air: { fork } } } }),
-      { code: -32602, message: '分叉点参数无效' });
+      { code: -32602, message: msg('forkPointInvalid') });
   }
   assert.equal(agent.sessions.size, 0);
 });
@@ -100,7 +101,7 @@ test('指定消息分叉取消后保留源会话并解除操作锁', async () =>
   agent.sessions.set(current.id, current);
   await assert.rejects(agent.forks.fork({ sessionId: 'source', _meta: { jetbrains: { air: {
     fork: { version: 1, messageId: 'reply' },
-  } } } }), { code: -32602, message: 'pi 未执行指定消息分叉' });
+  } } } }), { code: -32602, message: msg('forkAtMessageFailed') });
   assert.equal(agent.sessions.get('source'), current);
   assert.equal(current.changingConfig, false);
 });
@@ -156,7 +157,7 @@ test('MCP 重连失败恢复源映射，后台任务运行时不重连', async (
   assert.equal(current.changingConfig, false);
   assert.equal(closed, false);
   agent.tasks.tasks.set('running', { owner: current.id, state: 'running' });
-  await assert.rejects(agent.resumeSession(params), { code: -32602, message: '后台任务正在运行，请结束任务后再更新 MCP 配置' });
+  await assert.rejects(agent.resumeSession(params), { code: -32602, message: msg('tasksRunningMcp') });
   assert.equal(agent.sessions.get(current.id), current);
   assert.equal(closed, false);
 });

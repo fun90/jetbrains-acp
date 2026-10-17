@@ -3,7 +3,8 @@ import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { invalid, restrictedModes } from './shared.js';
+import { invalid, logError, restrictedModes } from './shared.js';
+import { t } from './i18n.js';
 
 const running = task => task.state === 'running';
 const MAX_OUTPUT = 256 * 1024;
@@ -36,7 +37,7 @@ export class Tasks {
 
   owned(session, id) {
     const task = this.tasks.get(id);
-    if (!task || task.owner !== session.id) throw invalid('任务不存在或不属于当前会话');
+    if (!task || task.owner !== session.id) throw invalid(t('taskNotFound'));
     return task;
   }
 
@@ -98,7 +99,7 @@ export class Tasks {
   }
 
   shellDirectory(session, task) {
-    if (!session.file) throw invalid('会话没有持久化路径');
+    if (!session.file) throw invalid(t('sessionNoPath'));
     return join(`${session.file}.tasks`, task.id);
   }
 
@@ -106,7 +107,7 @@ export class Tasks {
     task.directory = this.shellDirectory(session, task);
     const root = `${session.file}.tasks`;
     await mkdir(root, { recursive: true, mode: 0o700 });
-    if (!(await lstat(root)).isDirectory()) throw invalid('后台任务目录无效');
+    if (!(await lstat(root)).isDirectory()) throw invalid(t('taskDirInvalid'));
     await mkdir(task.directory, { mode: 0o700 });
     task.token = randomUUID();
     await writeFile(join(task.directory, 'config.json'), JSON.stringify({ version: 1,
@@ -135,9 +136,9 @@ export class Tasks {
               !['running', 'completed', 'failed', 'stopped'].includes(state.state) ||
               typeof state.output !== 'string' || state.output.length > MAX_OUTPUT ||
               !Number.isSafeInteger(state.outputEnd) || state.outputEnd < state.output.length ||
-              !Number.isFinite(state.heartbeat)) throw invalid('后台任务状态文件无效');
+              !Number.isFinite(state.heartbeat)) throw invalid(t('taskStateInvalid'));
           if (state.state === 'running' && Date.now() - started > 10000 && Date.now() - state.heartbeat > 10000) {
-            throw new Error('后台任务执行进程失联，无法确认执行结果');
+            throw new Error(t('taskWorkerLost'));
           }
           const delta = state.output.slice(Math.max(0, outputEnd - (state.outputEnd - state.output.length)));
           outputEnd = state.outputEnd;
@@ -164,7 +165,7 @@ export class Tasks {
       void poll();
     });
     // 保留错误供 stop/close 检查，同时避免异步完成时产生未处理的拒绝。
-    task.completion.catch(error => process.stderr.write(`保存后台任务失败：${error.message}\n`));
+    task.completion.catch(error => logError('saveTaskFailed')(error));
   }
 
   async stopShell(task) {
@@ -241,11 +242,11 @@ export class Tasks {
       this.announce(session, task);
       if (task.childId) {
         try {
-          if (ancestors.has(task.childId)) throw invalid('子会话关系存在循环');
+          if (ancestors.has(task.childId)) throw invalid(t('childCycle'));
           const existing = this.agent.sessions.get(task.childId);
-          if (existing && (existing.parentId !== session.id || existing.taskId !== task.id)) throw invalid('子会话已由其他会话打开');
+          if (existing && (existing.parentId !== session.id || existing.taskId !== task.id)) throw invalid(t('childOpenedElsewhere'));
           const interrupted = !live && running(task);
-          if (interrupted) { task.state = 'disconnected'; task.error = '上次执行已断开，未自动重跑'; }
+          if (interrupted) { task.state = 'disconnected'; task.error = t('taskInterrupted'); }
           if (!existing?.turn) {
             if (context.replay !== false) task.output = '';
             const metadata = { parentId: session.id, taskId: task.id, mode: task.mode,
@@ -276,10 +277,10 @@ export class Tasks {
           task.directory = this.shellDirectory(session, task);
           if (!(await lstat(`${session.file}.tasks`)).isDirectory() ||
               !(await lstat(task.directory)).isDirectory() ||
-              !(await lstat(join(task.directory, 'config.json'))).isFile()) throw invalid('后台任务目录无效');
+              !(await lstat(join(task.directory, 'config.json'))).isFile()) throw invalid(t('taskDirInvalid'));
           const config = JSON.parse(await readFile(join(task.directory, 'config.json'), 'utf8'));
           if (config.owner !== session.id || config.taskId !== task.id || !uuid.test(config.token)) {
-            throw invalid('后台任务身份不匹配');
+            throw invalid(t('taskIdentityMismatch'));
           }
           task.token = config.token;
           this.watchShell(session, task);
@@ -290,18 +291,18 @@ export class Tasks {
 
   async start(session, kind, params, toolCallId = randomUUID()) {
     if (session.changingConfig || session.failure || session.turn?.cancelled || this.agent.closing) {
-      throw invalid('会话当前不能启动任务');
+      throw invalid(t('sessionCannotStartTask'));
     }
-    if (restrictedModes.includes(session.mode)) throw invalid('当前权限模式不允许启动任务');
+    if (restrictedModes.includes(session.mode)) throw invalid(t('modeForbidsTask'));
     const text = kind === 'agent' ? params.prompt : params.command;
     if (typeof text !== 'string' || !text.trim() || text.length > 100000 ||
-        (params.name !== undefined && (typeof params.name !== 'string' || params.name.length > 10000))) throw invalid('任务内容无效');
+        (params.name !== undefined && (typeof params.name !== 'string' || params.name.length > 10000))) throw invalid(t('taskContentInvalid'));
     if (kind === 'shell' && (!params.shell || typeof params.shell.shell !== 'string' ||
         !Array.isArray(params.shell.args) || params.shell.args.some(arg => typeof arg !== 'string'))) {
-      throw invalid('shell 配置无效');
+      throw invalid(t('shellConfigInvalid'));
     }
     const task = { id: randomUUID(), owner: session.id, toolCallId, kind, text,
-      name: params.name || (kind === 'agent' ? '子 agent' : text), mode: session.mode,
+      name: params.name || (kind === 'agent' ? t('subagent') : text), mode: session.mode,
       customInstructions: session.customInstructions, state: 'running',
       output: '', truncated: false, controller: new AbortController() };
     if (kind === 'agent') task.childId = randomUUID();
@@ -311,23 +312,23 @@ export class Tasks {
     try {
       await this.save(session, task);
       if (task.controller.signal.aborted || session.turn?.cancelled || this.agent.closing ||
-          restrictedModes.includes(session.mode)) throw invalid('任务已停止或权限已变更');
+          restrictedModes.includes(session.mode)) throw invalid(t('taskStoppedOrModeChanged'));
       if (kind === 'agent') {
         try {
           await this.agent.newSession({ cwd: session.cwd, mcpServers: session.mcpServers,
             _meta: { jetbrains: { air: { customInstructions: session.customInstructions } } } },
           { id: task.childId, parentId: session.id, taskId: task.id });
           const child = this.agent.sessions.get(task.childId);
-          if (task.controller.signal.aborted) throw invalid('任务已停止');
+          if (task.controller.signal.aborted) throw invalid(t('taskStopped'));
           const [provider, ...model] = session.currentModelId.split('/');
           await child.pi.request('set_model', { provider, modelId: model.join('/') });
           child.currentModelId = session.currentModelId;
           await child.pi.request('set_thinking_level', { level: session.thinkingLevel });
           await this.agent.refreshThinking(child);
           await this.agent.setMode(child, session.mode);
-          if (task.controller.signal.aborted || session.turn?.cancelled || this.agent.closing || restrictedModes.includes(session.mode)) throw invalid('任务已停止或权限已变更');
+          if (task.controller.signal.aborted || session.turn?.cancelled || this.agent.closing || restrictedModes.includes(session.mode)) throw invalid(t('taskStoppedOrModeChanged'));
           if (this.agent.nativeSubagents) this.agent.update(session, { sessionUpdate: 'subagent_spawned',
-            subagentSessionId: child.id, name: params.name || '子 agent', task: text,
+            subagentSessionId: child.id, name: params.name || t('subagent'), task: text,
             capabilities: { cancel: true, close: true } });
           else this.agent.update(session, { sessionUpdate: 'tool_call_update', toolCallId,
             ...(this.agent.airClient ? { _meta: { jetbrains: { air: { version: 1, subagent: true } } } } : {}),
@@ -353,7 +354,7 @@ export class Tasks {
         }
         await this.startShell(session, task, params);
       }
-      task.completion?.catch(error => process.stderr.write(`保存任务失败：${error.message}\n`));
+      task.completion?.catch(error => logError('saveTaskFailed')(error));
       return this.snapshot(task);
     } catch (error) {
       if (running(task)) await this.finish(task, task.controller.signal.aborted ? 'stopped' : 'failed', error);

@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { isAbsolute, resolve } from 'node:path';
 import { convertMcp } from './convert.js';
 import { invalid, requireCwd, requireId } from './shared.js';
+import { t } from './i18n.js';
 
 // session/fork：复制已有会话或从指定助手消息分叉，并让原会话 ID 继续指向原历史。
 export class SessionFork {
@@ -18,21 +19,21 @@ export class SessionFork {
         (fork.messageFingerprint !== undefined && (typeof fork.messageFingerprint !== 'string' ||
           !/^sha256:[a-fA-F0-9]{64}$/.test(fork.messageFingerprint))) ||
         (fork.messageOccurrence !== undefined && (!Number.isSafeInteger(fork.messageOccurrence) || fork.messageOccurrence < 1)))) {
-      throw invalid('分叉点参数无效');
+      throw invalid(t('forkPointInvalid'));
     }
     let source = this.agent.sessions.get(params.sessionId);
     if (!source) {
-      requireCwd(params.cwd, '分叉历史会话需要绝对 cwd');
+      requireCwd(params.cwd, t('forkCwdAbsolute'));
       const saved = await this.agent.index.find(params.sessionId, params.cwd);
-      if (!saved) throw invalid('当前目录中没有此历史会话');
+      if (!saved) throw invalid(t('savedSessionNotInCwd'));
       await this.agent.newSession({ cwd: params.cwd, mcpServers: params.mcpServers ?? [] },
         { id: saved.sessionId, path: saved.path });
       source = this.agent.sessions.get(params.sessionId);
     }
-    if (this.agent.busy(source)) throw invalid('会话正在使用，请稍后重试');
+    if (this.agent.busy(source)) throw invalid(t('sessionBusy'));
     const cwd = params.cwd ?? source.cwd;
     if (typeof cwd !== 'string' || !isAbsolute(cwd) || resolve(cwd) !== resolve(source.cwd)) {
-      throw invalid('分叉会话必须使用原工作目录');
+      throw invalid(t('forkCwdMismatch'));
     }
     const requestedMcp = params.mcpServers ?? source.mcpServers;
     convertMcp(requestedMcp);
@@ -61,7 +62,7 @@ export class SessionFork {
           return fingerprint === fork.messageFingerprint.toLowerCase() && ++occurrence === (fork.messageOccurrence ?? 1);
         });
       }
-      if (index < 0) throw invalid('当前分支中没有此助手消息');
+      if (index < 0) throw invalid(t('assistantMessageNotFound'));
       // 保留消息所在整轮，避免在工具调用与结果之间截断历史。
       const nextUser = branch.findIndex((entry, position) => position > index && entry.message?.role === 'user');
       forkEntryId = branch[nextUser < 0 ? branch.length - 1 : nextUser - 1].id;
@@ -74,17 +75,17 @@ export class SessionFork {
     const customInstructions = source.customInstructions ? { _meta: { jetbrains: { air: {
       customInstructions: source.customInstructions,
     } } } } : {};
-    if (!oldState.sessionFile) throw new Error('原会话未持久保存');
+    if (!oldState.sessionFile) throw new Error(t('sessionNotPersisted'));
     const cloned = forkEntryId
       ? await source.pi.request('prompt', { message: `/__acp_fork ${JSON.stringify(forkEntryId)}` })
       : await source.pi.request('clone');
-    if (cloned?.cancelled) throw invalid('pi 取消了会话分叉');
+    if (cloned?.cancelled) throw invalid(t('forkCancelled'));
     let newState;
     try {
       newState = await source.pi.request('get_state');
-      if (forkEntryId && newState.sessionId === source.id) throw invalid('pi 未执行指定消息分叉');
+      if (forkEntryId && newState.sessionId === source.id) throw invalid(t('forkAtMessageFailed'));
       if (!newState.sessionId || newState.sessionId === source.id || !newState.sessionFile) {
-        throw new Error('pi 未创建正确的分叉会话');
+        throw new Error(t('forkCreateFailed'));
       }
       await source.pi.request('prompt', { message: '/__acp_check' });
       await source.pi.request('prompt', { message: `/__acp_mode ${sourceMode === 'plan' ? 'plan' : 'default'}` });

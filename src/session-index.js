@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolve } from 'node:path';
 import { air, invalid, requireCwd, requireId } from './shared.js';
+import { t } from './i18n.js';
 
 const executeFile = promisify(execFile);
 
@@ -42,25 +43,25 @@ export class SessionIndex {
     }
     context.history = undefined;
     await context.pi.request('prompt', { message: `/__acp_list ${JSON.stringify({ all: params.cwd === undefined, cwds })}` });
-    if (!context.history) throw new Error('pi 未返回历史会话列表');
+    if (!context.history) throw new Error(t('piNoHistory'));
     return context.history;
   }
 
   async list(params, { includeArchived = false } = {}) {
     if (params.cursor !== undefined && (typeof params.cursor !== 'string' || !/^\d+$/.test(params.cursor))) {
-      throw invalid('会话列表游标无效');
+      throw invalid(t('listCursorInvalid'));
     }
     const offset = Number(params.cursor ?? 0);
-    if (!Number.isSafeInteger(offset)) throw invalid('会话列表游标无效');
+    if (!Number.isSafeInteger(offset)) throw invalid(t('listCursorInvalid'));
     const options = params._meta?.jetbrains?.air?.list ?? {};
     const limit = options.limit ?? Number.POSITIVE_INFINITY;
     if (options.limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)) {
-      throw invalid('会话列表数量限制无效');
+      throw invalid(t('listLimitInvalid'));
     }
     const archived = includeArchived ? 'all' : options.archived ?? 'unarchived';
-    if (!['unarchived', 'archived', 'all'].includes(archived)) throw invalid('归档筛选无效');
+    if (!['unarchived', 'archived', 'all'].includes(archived)) throw invalid(t('archivedFilterInvalid'));
     if (options.includeWorktrees !== undefined && typeof options.includeWorktrees !== 'boolean') {
-      throw invalid('includeWorktrees 必须是布尔值');
+      throw invalid(t('includeWorktreesBoolean'));
     }
     const created = await this.agent.newSession({ cwd: params.cwd ?? process.cwd(), mcpServers: [] }, { discovery: true });
     try {
@@ -77,7 +78,7 @@ export class SessionIndex {
     requireId(params.sessionId);
     const live = this.agent.sessions.get(params.sessionId);
     const saved = await this.find(params.sessionId);
-    if (!saved) throw invalid('没有此历史会话');
+    if (!saved) throw invalid(t('savedSessionNotFound'));
     if (archived && live) await this.agent.closeSession({ sessionId: live.id });
     const temporary = !this.agent.sessions.has(params.sessionId);
     if (temporary) await this.agent.newSession({ cwd: saved.cwd, mcpServers: [] }, { id: saved.sessionId, path: saved.path });
@@ -97,19 +98,19 @@ export class SessionIndex {
   }
 
   async subscribe(params) {
-    if (!this.agent.airIndex) throw invalid('客户端未协商 sessionIndex');
+    if (!this.agent.airIndex) throw invalid(t('sessionIndexNotNegotiated'));
     requireCwd(params.cwd);
-    if (this.subscriptions.size >= 8) throw invalid('会话列表订阅数量已达上限');
+    if (this.subscriptions.size >= 8) throw invalid(t('subscriptionLimit'));
     const subscription = { id: randomUUID(), cwd: params.cwd, active: true, previous: new Map() };
     this.subscriptions.set(subscription.id, subscription);
     try {
       subscription.context = await this.agent.newSession({ cwd: params.cwd, mcpServers: [] }, { discovery: true });
-      if (this.agent.closing) throw new Error('适配器正在关闭');
+      if (this.agent.closing) throw new Error(t('adapterClosing'));
       await this.refresh(subscription, false);
       subscription.timer = setInterval(() => {
         if (!subscription.active || subscription.pending || this.agent.closing) return;
         subscription.pending = this.refresh(subscription).catch(error => {
-          if (subscription.active && !this.agent.closing) process.stderr.write(`刷新会话列表失败：${error.message}\n`);
+          if (subscription.active && !this.agent.closing) process.stderr.write(`${t('refreshSessionListFailed', { error: error.message })}\n`);
         }).finally(() => { subscription.pending = null; });
       }, 2000);
       subscription.timer.unref();
@@ -138,7 +139,7 @@ export class SessionIndex {
   }
 
   async unsubscribe(params) {
-    if (typeof params.subscriptionId !== 'string' || !params.subscriptionId) throw invalid('缺少 subscriptionId');
+    if (typeof params.subscriptionId !== 'string' || !params.subscriptionId) throw invalid(t('missingSubscriptionId'));
     const subscription = this.subscriptions.get(params.subscriptionId);
     if (!subscription) return {};
     subscription.active = false;

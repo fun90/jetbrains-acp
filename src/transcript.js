@@ -1,5 +1,6 @@
 import { gitPatch, fileDiffs, toolPath } from './file-diff.js';
 import { readOnlyTools, terminalTools } from './shared.js';
+import { t } from './i18n.js';
 
 const toolKind = name => ({ read: 'read', grep: 'search', find: 'search', ls: 'read',
   write: 'edit', edit: 'edit', update_plan: 'think', background_shell: 'execute', bash: 'execute', powershell: 'execute' })[name] || 'other';
@@ -138,7 +139,7 @@ export class Transcript {
         ...(status === 'failed' && error ? { error } : {}) });
     } else {
       this.agent.update(session, { sessionUpdate: status === 'in_progress' ? 'tool_call' : 'tool_call_update',
-        toolCallId: compactionId, ...(status === 'in_progress' ? { title: '压缩对话上下文', kind: 'think' } : {}),
+        toolCallId: compactionId, ...(status === 'in_progress' ? { title: t('compactingContext'), kind: 'think' } : {}),
         status: status === 'in_progress' ? 'in_progress' : status === 'completed' ? 'completed' : 'failed',
         ...(result ? { rawOutput: result } : {}),
       });

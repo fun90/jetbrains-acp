@@ -7,6 +7,7 @@ import { createBashToolDefinition, createPowerShellToolDefinition, getShellConfi
 import { readJsonl, writeJsonl } from '../src/jsonl.js';
 import { TerminalProcesses } from '../src/terminal-input.js';
 import { fileText, MAX_DIFF_BYTES, toolPath } from '../src/file-diff.js';
+import { t } from '../src/i18n.js';
 
 // 由适配器创建的临时配置，避免覆盖用户或项目的 MCP 设置。
 export default function (pi: any) {
@@ -22,14 +23,14 @@ export default function (pi: any) {
     pendingTasks.set(id, { resolve, reject });
     if (!inputChannel || inputChannel.destroyed) {
       pendingTasks.delete(id);
-      reject(new Error('ACP 任务通道未连接'));
+      reject(new Error(t('taskChannelDisconnected')));
       return;
     }
     writeJsonl(inputChannel, { type: 'acp_task_request', id, action, toolCallId, params });
   });
   const closeChannel = () => {
     shared.terminals.close();
-    for (const pending of pendingTasks.values()) pending.reject(new Error('ACP 任务通道已关闭'));
+    for (const pending of pendingTasks.values()) pending.reject(new Error(t('taskChannelClosed')));
     pendingTasks.clear();
   };
   for (const [event, action] of [
@@ -92,12 +93,12 @@ export default function (pi: any) {
     }
   }
   for (const [name, description, parameters] of [
-    ['spawn_agent', '创建独立上下文的子 agent 并在后台执行；返回 taskId，使用 task_status 查询，stop_task 停止。',
+    ['spawn_agent', 'Start a subagent with its own context in the background. Returns a taskId; query it with task_status and stop it with stop_task.',
       Type.Object({ prompt: Type.String({ minLength: 1 }), name: Type.Optional(Type.String()) })],
-    ['background_shell', '启动后台 shell 命令；返回 taskId，使用 task_status 查询输出，stop_task 停止整个进程组。',
+    ['background_shell', 'Start a background shell command. Returns a taskId; read output with task_status and stop the whole process group with stop_task.',
       Type.Object({ command: Type.String({ minLength: 1 }), timeout: Type.Optional(Type.Number({ minimum: 0.001 })) })],
-    ['task_status', '查询本会话创建的后台命令或子 agent 的状态与最近输出。', Type.Object({ taskId: Type.String() })],
-    ['stop_task', '仅停止指定 taskId 的后台命令或子 agent，不影响其他任务。', Type.Object({ taskId: Type.String() })],
+    ['task_status', 'Get the status and recent output of a background command or subagent created in this session.', Type.Object({ taskId: Type.String() })],
+    ['stop_task', 'Stop only the background command or subagent with the given taskId, leaving other tasks running.', Type.Object({ taskId: Type.String() })],
   ] as const) {
     pi.registerTool({ name, label: name, description, parameters,
       execute: async (id: string, args: any, _signal: AbortSignal, _update: any, ctx: any) => {
@@ -124,40 +125,40 @@ export default function (pi: any) {
     event.systemPromptOptions.sections = {
       ...sections,
       ...(config.customInstructions ? { acp_client_instructions: config.customInstructions } : {}),
-      ...(planMode ? { acp_plan_mode: '只分析问题并制定可执行计划，不修改文件、不执行命令或其他有副作用的工具。' } : {}),
-      ...(goal?.status === 'active' ? { acp_goal: `本会话长期目标：${goal.objective}` } : {}),
+      ...(planMode ? { acp_plan_mode: 'Only analyze the problem and produce an actionable plan. Do not modify files, run commands, or use other tools with side effects.' } : {}),
+      ...(goal?.status === 'active' ? { acp_goal: `Long-term goal for this session: ${goal.objective}` } : {}),
     };
   });
   pi.registerCommand('__acp_mode', {
-    description: '切换 ACP 规划模式',
+    description: 'Toggle ACP plan mode',
     handler: async (args: string) => { planMode = args.trim() === 'plan'; },
   });
   pi.registerCommand('__acp_fork', {
-    description: '在指定历史条目之后分叉 ACP 会话',
+    description: 'Fork the ACP session after a given history entry',
     handler: async (args: string, ctx: any) => {
       await ctx.fork(JSON.parse(args), { position: 'at' });
     },
   });
   pi.registerCommand('__acp_goal', {
-    description: '同步 ACP 长期目标',
+    description: 'Sync the ACP goal',
     handler: async (args: string) => {
       const value = JSON.parse(args);
       if (value !== null && (typeof value?.objective !== 'string' ||
-          !['active', 'paused'].includes(value.status))) throw new Error('ACP goal 无效');
+          !['active', 'paused'].includes(value.status))) throw new Error(t('goalInvalid'));
       pi.appendEntry('acp_goal', value);
       goal = value;
     },
   });
   pi.registerTool({
-    name: 'update_plan', label: '更新计划',
-    description: '用结构化步骤更新当前任务的执行计划和进度。仅记录计划，不执行文件或命令操作。',
+    name: 'update_plan', label: t('updatePlanLabel'),
+    description: 'Update the execution plan and progress of the current task with structured steps. Only records the plan; performs no file or command operations.',
     parameters: Type.Object({ entries: Type.Array(Type.Object({
       content: Type.String({ minLength: 1, maxLength: 10000 }),
       priority: Type.Union([Type.Literal('high'), Type.Literal('medium'), Type.Literal('low')]),
       status: Type.Union([Type.Literal('pending'), Type.Literal('in_progress'), Type.Literal('completed')]),
     }), { maxItems: 100 }) }),
     execute: async (_id: string, input: any) => ({
-      content: [{ type: 'text', text: '计划已更新' }], details: { acpPlan: input.entries },
+      content: [{ type: 'text', text: 'Plan updated' }], details: { acpPlan: input.entries },
     }),
   });
   const messageIds = new Map<string, string>();
@@ -178,7 +179,7 @@ export default function (pi: any) {
     pi.registerMcpServer(name, server);
   }
   pi.registerCommand('__acp_check', {
-    description: '检查 ACP 适配器连接',
+    description: 'Check the ACP adapter connection',
     handler: async (_args: string, ctx: any) => {
       goal = ctx.sessionManager.getBranch().findLast((entry: any) =>
         entry.type === 'custom' && entry.customType === 'acp_goal')?.data ?? null;
@@ -187,11 +188,11 @@ export default function (pi: any) {
     },
   });
   pi.registerCommand('__acp_archive', {
-    description: '同步 ACP 归档状态',
+    description: 'Sync the ACP archive state',
     handler: async (args: string) => { pi.appendEntry('acp_archive', args.trim() === 'true'); },
   });
   pi.registerCommand('__acp_list', {
-    description: '列出 ACP 可恢复的 pi 会话',
+    description: 'List pi sessions that ACP can resume',
     handler: async (args: string, ctx: any) => {
       const directory = config.sessionDir || process.env.PI_CODING_AGENT_SESSION_DIR ||
         SettingsManager.create(ctx.cwd).getSessionDir();
@@ -219,14 +220,14 @@ export default function (pi: any) {
   });
   pi.on('tool_call', async (event: any, ctx: any) => {
     if (['read', 'grep', 'find', 'ls', 'update_plan', 'task_status'].includes(event.toolName)) return;
-    if (planMode) return { block: true, reason: '规划模式不允许此工具调用' };
+    if (planMode) return { block: true, reason: t('planModeBlocked') };
     try {
       const approved = await ctx.ui.confirm('PI_ACP_PERMISSION', JSON.stringify({
         toolCallId: event.toolCallId, toolName: event.toolName, args: event.input,
       }));
-      if (!approved) return { block: true, reason: '用户未授权此工具调用' };
+      if (!approved) return { block: true, reason: t('userDenied') };
     } catch {
-      return { block: true, reason: 'IDEA 授权通道不可用' };
+      return { block: true, reason: t('permissionChannelUnavailable') };
     }
     if (!['edit', 'write'].includes(event.toolName) || typeof event.input?.path !== 'string') return;
     try {

@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { Agent } from '../src/agent.js';
 import { resolvePi } from '../src/pi-command.js';
 import { ProtocolAgent } from '../src/protocol.js';
+import { t as msg } from '../src/i18n.js';
 
 const execute = promisify(execFile);
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
@@ -54,7 +55,7 @@ test('终端认证启动失败时返回非零退出码并给出诊断', async ()
   await assert.rejects(execute(process.execPath,
     [entry, '--setup', '--pi-command', '/不存在的目录/pi']), error => {
     assert.equal(error.code, 1);
-    assert.match(error.stderr, /无法启动 pi/);
+    assert.ok(error.stderr.includes(msg('piStartFailed', { error: '' })));
     return true;
   });
 });

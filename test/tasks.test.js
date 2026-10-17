@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 const directories = [];
 test.after(async () => { for (const path of directories) await rm(path, { recursive: true, force: true }); });
 import { Agent } from '../src/agent.js';
+import { t as msg } from '../src/i18n.js';
 
 async function setup(capabilities = {}) {
   const records = [];
@@ -42,7 +43,7 @@ test('后台任务返回 ID、逐块输出、退出状态，并拒绝跨会话�
   const { agent, parent, records } = await setup(air);
   const task = await agent.tasks.start(parent, 'shell', { shell, command: 'printf "你好"; exit 7' }, 'shell-1');
   const stored = agent.tasks.tasks.get(task.taskId);
-  await assert.rejects(agent.tasks.stop({ id: 'other' }, task.taskId), /不属于/);
+  await assert.rejects(agent.tasks.stop({ id: 'other' }, task.taskId), { message: msg('taskNotFound') });
   await stored.completion;
   assert.equal(stored.state, 'failed');
   assert.equal(stored.output, '你好');
@@ -87,16 +88,16 @@ test('任务入口校验权限、参数与授权令牌', async () => {
   const { agent, parent } = await setup();
   for (const mode of ['plan', 'read-only']) {
     parent.mode = mode;
-    await assert.rejects(agent.tasks.start(parent, 'shell', { shell, command: 'echo no' }), /权限/);
+    await assert.rejects(agent.tasks.start(parent, 'shell', { shell, command: 'echo no' }), { message: msg('modeForbidsTask') });
   }
   parent.mode = 'standard';
-  await assert.rejects(agent.tasks.start(parent, 'agent', { prompt: '' }), /内容/);
+  await assert.rejects(agent.tasks.start(parent, 'agent', { prompt: '' }), { message: msg('taskContentInvalid') });
   await assert.rejects(agent.tasks.start(parent, 'shell', { command: 'echo no' }), /shell/);
   parent.turn = {};
   let response;
   parent.pi = { controlResponse: (...args) => { response = args; } };
   await agent.control(parent, { id: 'request', action: 'spawn_agent', toolCallId: 'unapproved', params: { prompt: 'no' } });
-  assert.match(response[2].message, /尚未授权/);
+  assert.equal(response[2].message, msg('taskToolUnauthorized'));
   assert.equal(agent.tasks.tasks.size, 0);
 });
 
@@ -171,7 +172,7 @@ test('子 agent 启动期间停止不会留下会话，也不会先于创建事�
   const task = [...agent.tasks.tasks.values()][0];
   const stop = agent.tasks.stop(parent, task.id);
   release();
-  await assert.rejects(start, /已停止/);
+  await assert.rejects(start, error => [msg('taskStopped'), msg('taskStoppedOrModeChanged')].includes(error.message));
   assert.deepEqual(await stop, { stopped: true });
   assert.equal(agent.sessions.has(task.childId), false);
   assert.equal(task.state, 'stopped');
@@ -247,7 +248,7 @@ test('后台任务恢复拒绝身份不符的执行目录，保留失败记录',
     text: 'command', name: '任务', mode: 'standard', state: 'running', output: '', truncated: false };
   await agent.tasks.restore(parent, [{ type: 'custom', customType: 'acp_task', data }]);
   assert.equal(agent.tasks.tasks.get(id).state, 'failed');
-  assert.match(agent.tasks.tasks.get(id).error, /身份不匹配/);
+  assert.equal(agent.tasks.tasks.get(id).error, msg('taskIdentityMismatch'));
   await assert.rejects(access(join(directory, 'stop')), { code: 'ENOENT' });
 });
 
