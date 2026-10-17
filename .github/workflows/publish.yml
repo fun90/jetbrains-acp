@@ -1,0 +1,76 @@
+name: CI and npm publish
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+        env:
+          PI_ACP_SMOKE: '1'
+      - run: npm pack --dry-run
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'fun90/jetbrains-pi-acp'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: 核对版本 tag 与发布清单
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const read = path => JSON.parse(readFileSync(path, 'utf8'));
+          const pkg = read('package.json');
+          const lock = read('package-lock.json');
+          const agent = read('registry/jetbrains-pi-acp/agent.json');
+          assert.match(pkg.version, /^\d+\.\d+\.\d+$/, '仅支持正式版本');
+          assert.equal(process.env.GITHUB_REF_NAME, `v${pkg.version}`, 'tag 与包版本不一致');
+          assert.equal(lock.version, pkg.version);
+          assert.equal(lock.packages[''].version, pkg.version);
+          assert.equal(agent.version, pkg.version);
+          assert.equal(agent.distribution.npx.package, `${pkg.name}@${pkg.version}`);
+          NODE
+      - run: npm install --global npm@11.19.0
+      - run: npm ci
+      - name: 通过 OIDC 发布
+        run: npm publish --access public --provenance
+      - name: 核对已发布版本
+        run: |
+          version=$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')
+          npm view "jetbrains-pi-acp@$version" version dist.integrity
+          npm view jetbrains-pi-acp dist-tags --json
